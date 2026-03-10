@@ -51,4 +51,4 @@
 - Доступ к `opkg` (для установки `parted`, `tune2fs`, `ntfs-3g-utils`, `curl` и самого KeenSnap при необходимости).
 
 ## Установка
-opkg update && opkg install curl && curl -L -s "https://github.com/miha75vu-bit/Flashkeen/releases/download/keenetic%2Cnetcraze%2Ckeensnap/flashkeen.sh" > /tmp/install.sh && sh /tmp/install.sh
+opkg update && opkg install curl && curl -L -s "https://github.com/miha75vu-bit/Flashkeen/blob/main/install.sh" > /tmp/install.sh && sh /tmp/install.sh
