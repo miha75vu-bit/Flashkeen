@@ -59,7 +59,7 @@
 - Установленное Entware.
 - Доступ к `opkg` (для установки `parted`, `tune2fs`, `ntfs-3g-utils`, `curl` и самого KeenSnap при необходимости).
 
-## Установка
+## Установка и обновление
 
 opkg update && opkg install curl && \
 curl -L -s "https://raw.githubusercontent.com/miha75vu-bit/Flashkeen/main/install.sh" > /tmp/flashkeen-install.sh && \
