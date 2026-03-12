@@ -15,7 +15,7 @@ $OPKG_BIN install curl
 mkdir -p /opt/bin
 
 echo "Скачиваю Flashkeen..."
-curl -L -s "https://github.com/miha75vu-bit/Flashkeen/releases/download/Flashkeen/flashkeen" \
+curl -L -s "https://github.com/miha75vu-bit/Flashkeen/releases/download/Flashkeen1.2/flashkeen" \
   -o /opt/bin/flashkeen
 
 chmod +x /opt/bin/flashkeen
