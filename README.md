@@ -1,4 +1,4 @@
-# Flashkeen — простое управление дисками, бэкапами и Entware на Keenetic/Netcraze (без ПК)
+# Flashkeen — простое управление дисками, бэкапами и Entware на Keenetic/Netcraze без ПК
 
 `Flashkeen` — интерактивный помощник для роутеров Keenetic/Netcraze и роутеров на прошивке Keenetic/Netcraze (порт/стороннее устройство), который превращает рутину с Entware и дисками в понятное меню: разметка/форматирование, бэкапы (KeenSnap/KeenKit), перенос Entware, установка Entware “с нуля” (USB или внутренняя память).
 
