@@ -86,8 +86,8 @@ Flashkeen умеет проверять обновления при запуск
 
 ### 1) Как запустить Flashkeen на “пустой” системе, ведь требуется OPKG/Entware?
 Есть несколько вариантов:
-
-- **1) Встроенная память (`storage:`) через CLI-команду**  
+<details>
+<summary>▸- **1) Встроенная память (`storage:`) через CLI-команду** </summary
 
 Выберите команду в соответствии с архитектурой роутера и выполните её в [CLI роутера](http://192.168.1.1/a):
 
@@ -117,7 +117,7 @@ opkg disk storage:/ https://bin.entware.net/aarch64-k3.10/installer/aarch64-inst
 ```
 
 </details>
-
+</details>
 <details>
 <summary><b>2) Вторая флешка / второй USB</b></summary>
 
