@@ -39,7 +39,8 @@ rm -f \
   /opt/var/lib/flashkeen/active_stage.state \
   /opt/var/lib/flashkeen/instance.lock \
   /opt/var/lib/flashkeen/console_tail.lock \
-  /opt/var/lib/flashkeen/session_resize_check_seen.flag
+  /opt/var/lib/flashkeen/session_resize_check_seen.flag \
+  /opt/var/lib/flashkeen/keenkit_backup_dir
 
 rm_rf_if_exists /opt/var/lib/flashkeen/fsck_today
 rm_rf_if_exists /opt/var/lib/flashkeen/op_state
@@ -112,22 +113,129 @@ else
   echo "opkg не найден, KeenSnap не удаляю."
 fi
 
-echo "Готово."
+flashkeen_uninstall_keenkit_version_from_script() {
+  script_path="$1"
+  [ -f "$script_path" ] || return 0
+  grep -m1 '^SCRIPT_VERSION=' "$script_path" 2>/dev/null \
+    | sed 's/^SCRIPT_VERSION="\?\([^"]*\)"\?/\1/' \
+    | tr -d '\015'
+}
+
+flashkeen_uninstall_keenkit_describe_path() {
+  item_path="$1"
+  [ -n "$item_path" ] || return 0
+  if [ -L "$item_path" ]; then
+    link_target=$(readlink "$item_path" 2>/dev/null || true)
+    if [ -n "$link_target" ]; then
+      echo "  $item_path -> $link_target"
+    else
+      echo "  $item_path (ссылка)"
+    fi
+    return 0
+  fi
+  if [ -f "$item_path" ]; then
+    item_version=$(flashkeen_uninstall_keenkit_version_from_script "$item_path")
+    if [ -n "$item_version" ]; then
+      echo "  $item_path (версия $item_version)"
+    else
+      echo "  $item_path"
+    fi
+    return 0
+  fi
+  echo "  $item_path (не найден)"
+}
+
+flashkeen_uninstall_keenkit_collect_hits() {
+  keenkit_hits=""
+  keenkit_version=""
+  keenkit_script_for_version=""
+
+  if command -v keenkit >/dev/null 2>&1; then
+    keenkit_cmd=$(command -v keenkit)
+    case " $keenkit_hits " in
+      *" $keenkit_cmd "*) ;;
+      *) keenkit_hits="$keenkit_hits $keenkit_cmd" ;;
+    esac
+    if [ -z "$keenkit_script_for_version" ] && [ -f "$keenkit_cmd" ]; then
+      keenkit_script_for_version="$keenkit_cmd"
+    fi
+  fi
+
+  for candidate in /opt/keenkit.sh /opt/bin/keenkit.sh /opt/bin/keenkit; do
+    if [ -f "$candidate" ] || [ -L "$candidate" ]; then
+      case " $keenkit_hits " in
+        *" $candidate "*) ;;
+        *) keenkit_hits="$keenkit_hits $candidate" ;;
+      esac
+      if [ -z "$keenkit_script_for_version" ] && [ -f "$candidate" ]; then
+        keenkit_script_for_version="$candidate"
+      fi
+    fi
+  done
+
+  if [ -n "$keenkit_script_for_version" ]; then
+    keenkit_version=$(flashkeen_uninstall_keenkit_version_from_script "$keenkit_script_for_version")
+  fi
+
+  keenkit_hits=$(printf '%s\n' "$keenkit_hits" | awk 'NF {print}' | sort -u | tr '\n' ' ')
+}
+
+flashkeen_uninstall_keenkit_remove_all() {
+  rm -f /opt/bin/keenkit /opt/keenkit.sh /opt/bin/keenkit.sh 2>/dev/null || true
+  rm -f /opt/var/lib/flashkeen/keenkit_backup_dir 2>/dev/null || true
+}
 
 echo
 echo "Проверяю KeenKit..."
-keenkit_found=0
-if command -v keenkit >/dev/null 2>&1; then
-  keenkit_found=1
-fi
-if [ -x /opt/keenkit.sh ]; then
-  keenkit_found=1
-fi
+flashkeen_uninstall_keenkit_collect_hits
 
-if [ "$keenkit_found" -eq 1 ]; then
+if [ -n "$keenkit_hits" ]; then
   echo
-  echo "KeenKit установлен."
-  echo "К сожалению, его автор не сделал доступной функцию удаления — возможно, она появится в дальнейшем."
-  echo "Справка: https://keeneticported.dev/wiki/helpful/keenkit"
+  echo "Найдены следы KeenKit:"
+  for hit in $keenkit_hits; do
+    flashkeen_uninstall_keenkit_describe_path "$hit"
+  done
+  if [ -n "$keenkit_version" ]; then
+    echo "Версия скрипта KeenKit: $keenkit_version"
+  else
+    echo "Версию скрипта KeenKit определить не удалось."
+  fi
+
+  keensnap_traces=0
+  if command -v opkg >/dev/null 2>&1 && opkg list-installed 2>/dev/null | grep -q '^keensnap '; then
+    keensnap_traces=1
+  fi
+  if [ -f /opt/etc/keensnap/keensnap.conf ] || [ -f /opt/etc/keensnap.conf ] \
+    || [ -f /opt/share/keensnap/keensnap.sh ] || [ -f /opt/bin/keensnap ]; then
+    keensnap_traces=1
+  fi
+  if [ "$keensnap_traces" -eq 1 ]; then
+    echo
+    echo "Есть следы KeenSnap. Если бэкапы делались через KeenSnap, файлы KeenKit, скорее всего, остаток старой установки — их можно удалить."
+  fi
+
+  printf "Удалить KeenKit? (y/N): "
+  read answer || answer=""
+  case "$answer" in
+    y|Y|yes|YES)
+      echo "Удаляю KeenKit..."
+      flashkeen_uninstall_keenkit_remove_all
+      flashkeen_uninstall_keenkit_collect_hits
+      if [ -n "$keenkit_hits" ]; then
+        echo "KeenKit удалить не удалось полностью. Осталось:"
+        for hit in $keenkit_hits; do
+          flashkeen_uninstall_keenkit_describe_path "$hit"
+        done
+      else
+        echo "KeenKit удалён."
+      fi
+      ;;
+    *)
+      echo "KeenKit не трогаю."
+      ;;
+  esac
+else
+  echo "KeenKit не найден."
 fi
 
+echo "Готово."
