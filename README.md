@@ -87,7 +87,9 @@ sh /tmp/flashkeen-uninstall.sh
 
 ---
 
-## FAQ
+## FAQ 
+
+Группа в Telegram[Группа в Telegram](https://t.me/+B7g2K9cM7-5iMGJi)
 
 ### 0) Flashkeen сам обновляется? Что такое `test` и выбор версий?
 Flashkeen умеет проверять обновления при запуске (не чаще раза в сутки) либо команде в терминале "update".
