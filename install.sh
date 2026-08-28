@@ -1,6 +1,11 @@
 #!/bin/sh
 set -e
 
+REPO="miha75vu-bit/Flashkeen"
+RELEASES_API_URL="https://api.github.com/repos/$REPO/releases?per_page=10"
+DEFAULT_ASSET_URL="https://github.com/$REPO/releases/latest/download/flashkeen"
+TAB=$(printf '\t')
+
 OPKG_BIN="$(command -v opkg || true)"
 if [ -z "$OPKG_BIN" ]; then
   echo "opkg не найден. Запустите установку в среде Entware."
@@ -18,66 +23,109 @@ fi
 
 mkdir -p /opt/bin
 
-REPO="miha75vu-bit/Flashkeen"
-LATEST_API_URL="https://api.github.com/repos/$REPO/releases/latest"
-RELEASES_API_URL="https://api.github.com/repos/$REPO/releases?per_page=10"
-DEFAULT_ASSET_URL="https://github.com/$REPO/releases/latest/download/flashkeen"
+# tag<TAB>name<TAB>prerelease по каждому релизу, новые сначала.
+# Значения читаются с учётом кавычек и экранирования, поэтому запятые в названиях не ломают разбор.
+github_releases_tsv() {
+  curl -fsL --connect-timeout 5 --max-time 20 "$1" 2>/dev/null | awk '
+    function jstr(s, start,   i, c, out) {
+        i = start + 1
+        out = ""
+        while (i <= length(s)) {
+            c = substr(s, i, 1)
+            if (c == "\\") { out = out substr(s, i + 1, 1); i += 2; continue }
+            if (c == "\"") break
+            out = out c
+            i++
+        }
+        JEND = i
+        return out
+    }
+    function field(s, pos, key,   p, rest) {
+        p = index(substr(s, pos), "\"" key "\":")
+        if (p == 0) return -1
+        p = pos + p - 1 + length(key) + 3
+        rest = substr(s, p)
+        if (match(rest, /^[ \t]*"/) == 0) { JEND = p; JVAL = ""; return 0 }
+        JVAL = jstr(s, p + RLENGTH - 1)
+        return 1
+    }
+    { doc = doc $0 }
+    END {
+        pos = 1
+        while (1) {
+            if (field(doc, pos, "tag_name") == -1) break
+            tag = JVAL
+            pos = JEND + 1
+            if (field(doc, pos, "name") == -1) break
+            name = JVAL
+            pos = JEND + 1
+            pre = "false"
+            p = index(substr(doc, pos), "\"prerelease\":")
+            if (p > 0) {
+                p = pos + p - 1 + 13
+                if (substr(doc, p, 5) ~ /true/) pre = "true"
+            }
+            if (tag != "") print tag "\t" name "\t" pre
+        }
+    }
+  '
+}
+
+split_row() {
+  row="$1"
+  ROW_TAG=${row%%"$TAB"*}
+  row_rest=${row#*"$TAB"}
+  ROW_NAME=${row_rest%%"$TAB"*}
+  ROW_PRE=${row_rest#*"$TAB"}
+  [ "$ROW_TAG" != "$row" ] || { ROW_NAME=""; ROW_PRE="false"; }
+  [ -n "$ROW_NAME" ] || ROW_NAME="$ROW_TAG"
+}
 
 chosen_url="$DEFAULT_ASSET_URL"
 chosen_label="latest release"
 
 echo "Проверяю последнюю версию Flashkeen..."
-latest_json="$(curl -fsL --connect-timeout 2 --max-time 8 "$LATEST_API_URL" 2>/dev/null || true)"
-latest_tag="$(printf "%s\n" "$latest_json" | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | awk 'NR==1{print; exit}')"
-latest_name="$(printf "%s\n" "$latest_json" | sed -n 's/.*"name":[[:space:]]*"\([^"]*\)".*/\1/p' | awk 'NR==1{print; exit}')"
-[ -n "$latest_name" ] || latest_name="$latest_tag"
+releases="$(github_releases_tsv "$RELEASES_API_URL" || true)"
 
-latest_lc="$(printf "%s %s" "$latest_tag" "$latest_name" | tr '[:upper:]' '[:lower:]')"
-case "$latest_lc" in
-  *test*)
-    prev_tag=""
-    prev_name=""
-    rel_json="$(curl -fsL --connect-timeout 2 --max-time 8 "$RELEASES_API_URL" 2>/dev/null || true)"
-    if [ -n "$rel_json" ]; then
-      prev_line="$(printf "%s" "$rel_json" | tr '\n' ' ' | sed 's/},{/\
-/g' | awk '
-        {
-          tag=""; name="";
-          if (match($0, /"tag_name"[[:space:]]*:[[:space:]]*"[^"]+"/)) {
-            tag=substr($0, RSTART, RLENGTH);
-            sub(/^.*"/,"",tag); sub(/"$/,"",tag);
-          }
-          if (match($0, /"name"[[:space:]]*:[[:space:]]*"[^"]+"/)) {
-            name=substr($0, RSTART, RLENGTH);
-            sub(/^.*"/,"",name); sub(/"$/,"",name);
-          }
-          lc=tolower(tag " " name);
-          if (tag != "" && index(lc, "test") == 0) {
-            print tag "|" name;
-            exit
-          }
-        }')"
-      prev_tag="$(printf "%s" "$prev_line" | awk -F'|' '{print $1}')"
-      prev_name="$(printf "%s" "$prev_line" | awk -F'|' '{print $2}')"
-      [ -n "$prev_name" ] || prev_name="$prev_tag"
-    fi
+latest_row="$(printf "%s\n" "$releases" | awk 'NR==1 && $0 != "" {print; exit}')"
+if [ -n "$latest_row" ]; then
+  split_row "$latest_row"
+  latest_tag="$ROW_TAG"
+  latest_name="$ROW_NAME"
+  latest_pre="$ROW_PRE"
+  chosen_label="$latest_name"
 
-    if [ -n "$prev_tag" ] && [ -t 0 ]; then
+  # Тестовая сборка: prerelease на GitHub либо отдельное слово "test" в теге/названии.
+  # Проверка по границе слова, иначе "latest" ошибочно считается тестом.
+  is_test=0
+  [ "$latest_pre" = "true" ] && is_test=1
+  if printf " %s %s" "$latest_tag" "$latest_name" | tr '[:upper:]' '[:lower:]' | grep -q '[^a-z]test'; then
+    is_test=1
+  fi
+
+  if [ "$is_test" = "1" ]; then
+    prev_row="$(printf "%s\n" "$releases" | awk -F"$TAB" '
+      function has_test_marker(s) { return (" " tolower(s)) ~ /[^a-z]test/ }
+      $1 != "" && $3 != "true" && !has_test_marker($1) && !has_test_marker($2) { print; exit }
+    ')"
+    if [ -n "$prev_row" ] && [ -t 0 ]; then
+      split_row "$prev_row"
+      prev_tag="$ROW_TAG"
+      prev_name="$ROW_NAME"
       echo
       echo "Найдена тестовая сборка в latest:"
       echo "1) Установить test: $latest_name"
       echo "2) Установить предыдущую стабильную: $prev_name"
       echo "0) Отмена"
-      echo -n "Ваш выбор (по умолчанию 2): "
-      read ans
-      [ "$ans" = "00" ] && exit 0
-      [ -z "$ans" ] && ans="2"
+      printf "Ваш выбор (по умолчанию 2): "
+      read -r ans || ans=""
+      [ -n "$ans" ] || ans="2"
       case "$ans" in
         1)
           chosen_url="https://github.com/$REPO/releases/download/$latest_tag/flashkeen"
           chosen_label="$latest_name"
           ;;
-        0)
+        0|00)
           echo "Установка отменена."
           exit 0
           ;;
@@ -86,25 +134,32 @@ case "$latest_lc" in
           chosen_label="$prev_name"
           ;;
       esac
-    else
-      # Если нет интерактива или не нашли предыдущую — ставим latest как раньше.
-      chosen_url="$DEFAULT_ASSET_URL"
-      chosen_label="$latest_name"
     fi
-    ;;
-  *)
-    [ -n "$latest_tag" ] && chosen_label="$latest_name"
-    ;;
-esac
+  fi
+fi
 
 echo "Скачиваю Flashkeen: $chosen_label"
 curl -fL -s "$chosen_url" -o /opt/bin/flashkeen
 
+[ -s /opt/bin/flashkeen ] || {
+  echo "Не удалось скачать Flashkeen."
+  rm -f /opt/bin/flashkeen 2>/dev/null
+  exit 1
+}
+
 chmod +x /opt/bin/flashkeen
 
-# Алиасы для удобного запуска
+# Точки входа до первого запуска; дальше их обслуживает сам flashkeen.
 ln -sf /opt/bin/flashkeen /opt/bin/Flashkeen
-ln -sf /opt/bin/flashkeen /opt/bin/flash
+printf '%s\n' '#!/bin/sh' '/opt/bin/flashkeen "$@"' 'exit $?' > /opt/bin/flash
+chmod +x /opt/bin/flash 2>/dev/null || true
+
+echo "Установка базовых пакетов Entware..."
+if /opt/bin/flashkeen --install-core-packages; then
+  :
+else
+  echo "Предупреждение: не все базовые пакеты установились."
+fi
 
 echo "Flashkeen установлен."
 echo "Запуск: flashkeen  или  Flashkeen  или  flash"
