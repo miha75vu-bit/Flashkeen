@@ -1,0 +1,64 @@
+# Короткая команда для SSH Entware: ищет flashkeen*.ipk в корне дисков и ставит.
+# Положите IPK Flashkeen в корень вашего диска, скопируйте блок целиком и вставьте в SSH.
+
+sh <<'FLASHKEEN_IPK_ROOT'
+install_ipk() {
+  p="$1"
+  [ -f "$p" ] || { echo "Файл не найден: $p"; return 1; }
+  _abs="$p"
+  if command -v readlink >/dev/null 2>&1; then
+    _rp=$(readlink -f "$p" 2>/dev/null || true)
+    [ -n "$_rp" ] && _abs="$_rp"
+  fi
+  export FLASHKEEN_INSTALLED_IPK_PATH="$_abs"
+  rm -f /opt/tmp/opkg.lock 2>/dev/null || true
+  opkg remove flashkeen-installer >/dev/null 2>&1 || true
+  if opkg list-installed 2>/dev/null | grep -q '^flashkeen '; then
+    opkg remove flashkeen >/dev/null 2>&1 || true
+  fi
+  if ! opkg install "$p"; then
+    opkg install --force-reinstall "$p" || return 1
+  fi
+  if [ -x /opt/bin/flashkeen ]; then
+    /opt/bin/flashkeen --write-flash-wrapper 2>/dev/null || true
+  fi
+  if [ -x /opt/bin/flash ]; then
+    exec /opt/bin/flash
+  fi
+  if [ -x /opt/bin/flashkeen ]; then
+    exec /opt/bin/flashkeen
+  fi
+  echo "Пакет установлен, но /opt/bin/flash не найден."
+  return 1
+}
+if command -v curl >/dev/null 2>&1; then
+  curl -fsS -H "Content-Type: application/json" \
+    -d '[{"parse":"system mount storage:"}]' \
+    "http://localhost:79/rci/" >/dev/null 2>&1 || true
+fi
+n=0
+list=/tmp/flashkeen-ipk.short.list
+seen=/tmp/flashkeen-ipk.short.seen
+rm -f "$list" "$seen"
+for d in /storage /tmp/mnt/storage /mnt/storage /tmp/mnt/* /mnt/*; do
+  [ -d "$d" ] || continue
+  for x in "$d"/*; do
+    [ -f "$x" ] || continue
+    b=${x##*/}
+    echo "$b" | grep -qi flashkeen || continue
+    echo "$b" | grep -qi '\.ipk$' || continue
+    rp=$(readlink -f "$x" 2>/dev/null || echo "$x")
+    grep -Fxq "$rp" "$seen" 2>/dev/null && continue
+    echo "$rp" >> "$seen"
+    echo "$x" >> "$list"
+    n=$((n + 1))
+  done
+done
+if [ "$n" -eq 0 ]; then
+  echo "В корне дисков не найден *flashkeen*.ipk"
+  exit 1
+fi
+p=$(sed -n '1p' "$list")
+rm -f "$list" "$seen"
+install_ipk "$p"
+FLASHKEEN_IPK_ROOT
