@@ -73,14 +73,22 @@ Flashkeen сам определяет архитектуру роутера, з�
 
 ## Установка Flashkeen
 
+### Обычная установка
+
 Подключиться по SSH к Entware и выполнить:
 
 ```sh
 opkg update || true; opkg install curl || true; curl -fsSL https://raw.githubusercontent.com/miha75vu-bit/Flashkeen/main/install.sh | sh
 ```
-```
-[Команда для установки если недоступен Гитхаб на роутере или нет сети](https://github.com/miha75vu-bit/Flashkeen/blob/main/install%20ipk%20offline) для установки оффлайн версии Flashkeen.
-(Положить флешкин в корень диска, скопировать весь текст и вставить в командую строку)  
+
+### Оффлайн-установка
+
+Если на роутере недоступен GitHub или нет сети, используйте оффлайн-версию Flashkeen.
+
+[**Команда для установки оффлайн-версии Flashkeen**](https://github.com/miha75vu-bit/Flashkeen/blob/main/install%20ipk%20offline)
+
+Положить Flashkeen в корень диска, скопировать **весь текст из инструкции** и вставить его в командную строку.
+
 ---
 
 ## Удаление Flashkeen
