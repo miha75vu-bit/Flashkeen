@@ -85,9 +85,9 @@ opkg update || true; opkg install curl || true; curl -fsSL https://raw.githubuse
 
 Если на роутере недоступен GitHub или нет сети, используйте оффлайн-версию Flashkeen.
 
-[**Команда для установки оффлайн-версии Flashkeen**](https://github.com/miha75vu-bit/Flashkeen/blob/main/install%20ipk%20offline)
+[Команда для установки, если недоступен GitHub на роутере или нет сети](https://github.com/miha75vu-bit/Flashkeen/blob/main/install%20ipk%20offline)
 
-Положить Flashkeen в корень диска, скопировать **весь текст из инструкции** и вставить его в командную строку.
+Положить Flashkeen в корень диска, скопировать весь текст из инструкции и вставить его в командную строку.
 
 ---
 
