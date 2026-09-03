@@ -2,7 +2,7 @@
 set -e
 
 REPO="miha75vu-bit/Flashkeen"
-# GitHub /releases/latest никогда не указывает на prerelease.
+# /releases/latest — только стабильный (не prerelease).
 LATEST_API_URL="https://api.github.com/repos/$REPO/releases/latest"
 LATEST_ASSET_URL="https://github.com/$REPO/releases/latest/download/flashkeen"
 
@@ -22,8 +22,10 @@ fi
 
 mkdir -p /opt/bin
 
-# Имя стабильного релиза из /releases/latest (без списка, без prerelease).
-chosen_label=$(curl -fsL --connect-timeout 5 --max-time 20 "$LATEST_API_URL" 2>/dev/null | awk '
+# JSON /releases/latest: имя релиза и id ассета flashkeen.
+latest_json=$(curl -fsL --connect-timeout 8 --max-time 25 "$LATEST_API_URL" 2>/dev/null || true)
+
+chosen_label=$(printf '%s' "$latest_json" | awk '
   {
     p = index($0, "\"name\":")
     if (p == 0) next
@@ -44,15 +46,85 @@ chosen_label=$(curl -fsL --connect-timeout 5 --max-time 20 "$LATEST_API_URL" 2>/
 ')
 [ -n "$chosen_label" ] || chosen_label="latest release"
 
+# id ассета: ближайший "id" слева от "name":"flashkeen"
+asset_id=$(printf '%s' "$latest_json" | awk '
+  { doc = doc $0 }
+  END {
+    pos = 1
+    while (1) {
+      p = index(substr(doc, pos), "\"name\"")
+      if (p == 0) break
+      pos = pos + p - 1
+      rest = substr(doc, pos)
+      if (match(rest, /"name"[[:space:]]*:[[:space:]]*"flashkeen"/) == 0) {
+        pos = pos + 6
+        next
+      }
+      start = pos - 250
+      if (start < 1) start = 1
+      chunk = substr(doc, start, pos - start)
+      idpart = ""
+      while (match(chunk, /"id"[[:space:]]*:[[:space:]]*[0-9]+/)) {
+        idpart = substr(chunk, RSTART, RLENGTH)
+        chunk = substr(chunk, RSTART + RLENGTH)
+      }
+      gsub(/[^0-9]/, "", idpart)
+      if (idpart != "") { print idpart; exit }
+      pos = pos + 6
+    }
+  }
+')
+
+flashkeen_download_ok() {
+  [ -s /opt/bin/flashkeen ] || return 1
+  case "$(head -n 1 /opt/bin/flashkeen 2>/dev/null)" in
+    '#!/'*) return 0 ;;
+  esac
+  return 1
+}
+
 echo "Проверяю последнюю версию Flashkeen..."
 echo "Скачиваю Flashkeen: $chosen_label"
-curl -fL -s --connect-timeout 10 --max-time 180 "$LATEST_ASSET_URL" -o /opt/bin/flashkeen
 
-[ -s /opt/bin/flashkeen ] || {
-  echo "Не удалось скачать Flashkeen."
-  rm -f /opt/bin/flashkeen 2>/dev/null
-  exit 1
-}
+dl_ok=0
+rm -f /opt/bin/flashkeen 2>/dev/null || true
+
+# 1) Через api.github.com (часто доступен, когда github.com/CDN — нет).
+if [ -n "$asset_id" ]; then
+  case "$asset_id" in
+    *[!0-9]*) ;;
+    *)
+      api_url="https://api.github.com/repos/$REPO/releases/assets/$asset_id"
+      if curl -fL -s --connect-timeout 10 --max-time 180 \
+          -H "Accept: application/octet-stream" \
+          -H "User-Agent: flashkeen-install" \
+          "$api_url" -o /opt/bin/flashkeen \
+        && flashkeen_download_ok; then
+        dl_ok=1
+      else
+        rm -f /opt/bin/flashkeen 2>/dev/null || true
+      fi
+      ;;
+  esac
+fi
+
+# 2) Фолбэк: releases/latest/download (github.com → CDN).
+if [ "$dl_ok" != "1" ]; then
+  set +e
+  curl -fL -s --connect-timeout 10 --max-time 180 "$LATEST_ASSET_URL" -o /opt/bin/flashkeen
+  _curl_rc=$?
+  set -e
+  if [ "$_curl_rc" -eq 0 ] && flashkeen_download_ok; then
+    dl_ok=1
+  else
+    rm -f /opt/bin/flashkeen 2>/dev/null || true
+    echo "Не удалось скачать Flashkeen (curl код ${_curl_rc:-?})."
+    [ -n "$asset_id" ] && echo "Пробовали API asset id: $asset_id"
+    echo "Пробовали URL: $LATEST_ASSET_URL"
+    echo "api.github.com отвечает, скачивание с github.com/CDN на этом роутере часто падает."
+    exit 1
+  fi
+fi
 
 chmod +x /opt/bin/flashkeen
 
