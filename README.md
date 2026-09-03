@@ -77,7 +77,7 @@ Flashkeen сам определяет архитектуру роутера, з�
 
 ```sh
 opkg update || true; opkg install curl || true; curl -fsSL https://raw.githubusercontent.com/miha75vu-bit/Flashkeen/main/install.sh | sh
-```s
+```
 ```
 [Команда для установки если недоступен Гитхаб на роутере или нет сети](https://github.com/miha75vu-bit/Flashkeen/blob/main/install%20ipk%20offline) для установки оффлайн версии Flashkeen.
 (Положить флешкин в корень диска, скопировать весь текст и вставить в командую строку)  
