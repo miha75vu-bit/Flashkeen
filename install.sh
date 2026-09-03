@@ -61,11 +61,7 @@ printf '%s\n' '#!/bin/sh' '/opt/bin/flashkeen "$@"' 'exit $?' > /opt/bin/flash
 chmod +x /opt/bin/flash 2>/dev/null || true
 
 echo "Установка базовых пакетов Entware..."
-if /opt/bin/flashkeen --install-core-packages; then
-  :
-else
-  echo "Предупреждение: не все базовые пакеты установились."
-fi
+/opt/bin/flashkeen --install-core-packages || true
 
 echo "Flashkeen установлен."
 echo "Запуск: flashkeen  или  Flashkeen  или  flash"
