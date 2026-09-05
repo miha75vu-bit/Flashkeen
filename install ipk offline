@@ -1,8 +1,26 @@
 # Короткая команда для SSH Entware: ищет flashkeen*.ipk в корне дисков и ставит.
 # Положите IPK Flashkeen в корень вашего диска, скопируйте блок целиком и вставьте в SSH.
 
-sh <<'FLASHKEEN_IPK_ROOT'
-install_ipk() {
+sh <<'FLASHKEEN_OFFLINE_IPK_INSTALL'
+read_tty() {
+  if [ -c /dev/tty ] 2>/dev/null; then
+    IFS= read -r REPLY < /dev/tty
+  else
+    IFS= read -r REPLY
+  fi
+}
+tty_discard() {
+  [ -c /dev/tty ] 2>/dev/null || return 0
+  _old=$(stty -g </dev/tty 2>/dev/null) || return 0
+  stty -icanon min 0 time 0 </dev/tty 2>/dev/null || {
+    stty icanon echo </dev/tty 2>/dev/null || true
+    return 0
+  }
+  dd if=/dev/tty of=/dev/null bs=1 count=256 2>/dev/null || true
+  stty "$_old" </dev/tty 2>/dev/null || true
+  stty icanon echo </dev/tty 2>/dev/null || true
+}
+flashkeen_install_ipk_from_disk() {
   p="$1"
   [ -f "$p" ] || { echo "Файл не найден: $p"; return 1; }
   _abs="$p"
@@ -31,15 +49,15 @@ install_ipk() {
   echo "Пакет установлен, но /opt/bin/flash не найден."
   return 1
 }
+n=0
+list=/tmp/flashkeen-ipk.list
+seen=/tmp/flashkeen-ipk.seen
+rm -f "$list" "$seen"
 if command -v curl >/dev/null 2>&1; then
   curl -fsS -H "Content-Type: application/json" \
     -d '[{"parse":"system mount storage:"}]' \
     "http://localhost:79/rci/" >/dev/null 2>&1 || true
 fi
-n=0
-list=/tmp/flashkeen-ipk.short.list
-seen=/tmp/flashkeen-ipk.short.seen
-rm -f "$list" "$seen"
 for d in /storage /tmp/mnt/storage /mnt/storage /tmp/mnt/* /mnt/*; do
   [ -d "$d" ] || continue
   for x in "$d"/*; do
@@ -55,10 +73,37 @@ for d in /storage /tmp/mnt/storage /mnt/storage /tmp/mnt/* /mnt/*; do
   done
 done
 if [ "$n" -eq 0 ]; then
-  echo "В корне дисков не найден *flashkeen*.ipk"
-  exit 1
+  echo "В корне подключённых дисков (USB и встроенная память) не найден файл *flashkeen*.ipk"
+  rm -f "$list" "$seen"
+elif [ "$n" -eq 1 ]; then
+  p=$(sed -n '1p' "$list")
+  rm -f "$list" "$seen"
+  echo "Найден пакет: $p"
+  flashkeen_install_ipk_from_disk "$p"
+else
+  echo "Найдены пакеты:"
+  i=0
+  while IFS= read -r p; do
+    i=$((i + 1))
+    printf '%s) %s\n' "$i" "$p"
+  done < "$list"
+  printf "Номер для установки (0 — отмена): "
+  tty_discard
+  read_tty
+  c="$REPLY"
+  case "$c" in
+    ''|0|n|N|н|Н|no|NO) rm -f "$list" "$seen" ;;
+    *[!0-9]*) echo "Неверный выбор."; rm -f "$list" "$seen" ;;
+    *)
+      p=$(sed -n "${c}p" "$list")
+      rm -f "$list" "$seen"
+      if [ -n "$p" ] && [ -f "$p" ]; then
+        flashkeen_install_ipk_from_disk "$p"
+      else
+        echo "Нет такого пункта."
+      fi
+      ;;
+  esac
 fi
-p=$(sed -n '1p' "$list")
-rm -f "$list" "$seen"
-install_ipk "$p"
-FLASHKEEN_IPK_ROOT
+FLASHKEEN_OFFLINE_IPK_INSTALL
+true
