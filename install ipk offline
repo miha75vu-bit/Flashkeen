@@ -20,6 +20,63 @@ tty_discard() {
   stty "$_old" </dev/tty 2>/dev/null || true
   stty icanon echo </dev/tty 2>/dev/null || true
 }
+# Пока opkg ставит IPK: «Установка установщика…». Когда preinst начал «Распаковка…» — не перебиваем.
+flashkeen_opkg_install_ipk_with_status() {
+  _ipk="$1"
+  _fk_opkg_log="/tmp/flashkeen.ipk.opkg.$$"
+  _fk_opkg_rc="/tmp/flashkeen.ipk.opkg.rc.$$"
+  rm -f "$_fk_opkg_rc"
+  (
+    if opkg install "$_ipk" >"$_fk_opkg_log" 2>&1; then
+      echo 0 >"$_fk_opkg_rc"
+    elif opkg install --force-reinstall "$_ipk" >"$_fk_opkg_log" 2>&1; then
+      echo 0 >"$_fk_opkg_rc"
+    else
+      echo 1 >"$_fk_opkg_rc"
+    fi
+  ) &
+  _opid=$!
+  _n=0
+  while kill -0 "$_opid" 2>/dev/null; do
+    _bp=$(sed -n '1p' /opt/var/lib/flashkeen/ipk_install_blink.pid 2>/dev/null | tr -d '\r')
+    case "$_bp" in
+      ''|*[!0-9]*) ;;
+      *)
+        if kill -0 "$_bp" 2>/dev/null; then
+          wait "$_opid" 2>/dev/null || true
+          break
+        fi
+        ;;
+    esac
+    _n=$((_n + 1))
+    case $((_n % 3)) in
+      1) _d='.' ;;
+      2) _d='..' ;;
+      *) _d='...' ;;
+    esac
+    if [ -w /dev/tty ] 2>/dev/null; then
+      printf '\r\033[KУстановка установщика%s' "$_d" >/dev/tty
+    else
+      printf '\r\033[KУстановка установщика%s' "$_d"
+    fi
+    sleep 1
+  done
+  wait "$_opid" 2>/dev/null || true
+  _rc=$(sed -n '1p' "$_fk_opkg_rc" 2>/dev/null | tr -d '\r')
+  rm -f "$_fk_opkg_rc"
+  if [ "$_rc" = "0" ]; then
+    rm -f "$_fk_opkg_log"
+    return 0
+  fi
+  if [ -w /dev/tty ] 2>/dev/null; then
+    printf '\r\033[K\n' >/dev/tty
+  else
+    printf '\r\033[K\n'
+  fi
+  cat "$_fk_opkg_log" 2>/dev/null || true
+  rm -f "$_fk_opkg_log"
+  return 1
+}
 flashkeen_install_ipk_from_disk() {
   p="$1"
   [ -f "$p" ] || { echo "Файл не найден: $p"; return 1; }
@@ -34,9 +91,7 @@ flashkeen_install_ipk_from_disk() {
   if opkg list-installed 2>/dev/null | grep -q '^flashkeen '; then
     opkg remove flashkeen >/dev/null 2>&1 || true
   fi
-  if ! opkg install "$p"; then
-    opkg install --force-reinstall "$p" || return 1
-  fi
+  flashkeen_opkg_install_ipk_with_status "$p" || return 1
   if [ -x /opt/bin/flashkeen ]; then
     /opt/bin/flashkeen --write-flash-wrapper 2>/dev/null || true
   fi
@@ -106,4 +161,3 @@ else
   esac
 fi
 FLASHKEEN_OFFLINE_IPK_INSTALL
-true
