@@ -142,7 +142,11 @@ install_lucx() {
         ok "LucX уже установлен — пропускаем"
         return 0
     fi
-    echo "Устанавливаем LucX..."
+    echo "Устанавливаем LucX с автоматическим выбором SSL для IP (Let's Encrypt)..."
+    
+    export XUI_NONINTERACTIVE=1
+    export XUI_SSL_MODE="ip"
+
     curl -fsSL https://raw.githubusercontent.com/AlexeyLCP/lucx-ui/main/install.sh | bash
     systemctl daemon-reload
     [[ -x /usr/local/x-ui/x-ui ]] || die "LucX не установлен"
@@ -675,317 +679,6 @@ check_psiphon() {
     echo "    Country: ${loc:-unknown}"
 }
 
-# ==============================================================================
-# БЛОК ГЕНЕРАЦИИ ВХОДЯЩИХ ПОДКЛЮЧЕНИЙ (INBOUNDS) И КЛИЕНТА "1"
-# ==============================================================================
-
-cleanup_broken_inbounds() {
-    if [[ -f "$DB" ]] && command -v sqlite3 >/dev/null 2>&1; then
-        sqlite3 "$DB" "DELETE FROM inbounds WHERE protocol='vless' AND (stream_settings LIKE '%\"privateKey\":\"\"%' OR stream_settings NOT LIKE '%privateKey%');" 2>/dev/null || true
-        sqlite3 "$DB" "UPDATE inbounds SET stream_settings='{}' WHERE protocol='wireguard' OR stream_settings LIKE '%\"network\":\"udp\"%';" 2>/dev/null || true
-        sqlite3 "$DB" "DELETE FROM inbounds WHERE id NOT IN (SELECT MIN(id) FROM inbounds GROUP BY port);" 2>/dev/null || true
-    fi
-}
-
-manage_inbounds_xtuna() {
-    section "ТИПОВЫЕ ВХОДЯЩИЕ ПОДКЛЮЧЕНИЯ (INBOUNDS)"
-    info "Генерация пресетов: VLESS Reality XHTTP, VLESS Reality gRPC, AmneziaWG Kernel 3.1"
-    echo
-
-    cleanup_broken_inbounds
-
-    [[ -f "$DB" ]] || return 0
-
-    local check_result
-    check_result="$(python3 - "$DB" <<'PY'
-import sqlite3, sys
-
-conn = sqlite3.connect(sys.argv[1])
-cur = conn.cursor()
-cur.execute("SELECT port, remark, protocol, settings, stream_settings FROM inbounds")
-rows = cur.fetchall()
-
-xhttp = ""
-grpc = ""
-awg = ""
-
-for port, remark, proto, sett, stream in rows:
-    r = (remark or "").lower()
-    s = (sett or "").lower()
-    st = (stream or "").lower()
-
-    if proto == "vless" and "xhttp" in st:
-        xhttp = str(port)
-    elif proto == "vless" and "grpc" in st:
-        grpc = str(port)
-    elif proto == "wireguard":
-        awg = str(port)
-
-if xhttp and grpc and awg:
-    print(f"ALL|{xhttp}|{grpc}|{awg}")
-else:
-    print(f"PARTIAL|{xhttp}|{grpc}|{awg}")
-conn.close()
-PY
-)"
-
-    local status p_xhttp p_grpc p_awg
-    IFS='|' read -r status p_xhttp p_grpc p_awg <<< "$check_result"
-
-    if [[ "$status" == "ALL" ]]; then
-        ok "Все 3 типовых подключения уже настроены и работают в LucX:"
-        echo "    • VLESS Reality XHTTP : порт $p_xhttp"
-        echo "    • VLESS Reality gRPC  : порт $p_grpc"
-        echo "    • AmneziaWG Kernel 3.1 : порт $p_awg"
-        echo
-    else
-        local current_inbounds_count=0
-        current_inbounds_count="$(sqlite3 "$DB" "SELECT count(*) FROM inbounds WHERE tag != 'api' AND protocol != 'dokodemo-door';" 2>/dev/null || echo 0)"
-        info "В панели настроено подключений: $current_inbounds_count"
-        echo
-    fi
-
-    echo "0) Пропустить"
-    echo "1) Создать типовые пресеты"
-    echo "2) Очистить пресеты"
-    echo "3) Очистить и создать типовые пресеты"
-    echo
-    local in_choice=""
-    read -rp "Выберите действие [0/1/2/3, Enter=0]: " in_choice
-    in_choice="${in_choice:-0}"
-
-    case "$in_choice" in
-        0)
-            ok "Подключения сохранены без изменений"
-            return 0
-            ;;
-        2)
-            sqlite3 "$DB" "DELETE FROM inbounds WHERE tag != 'api' AND protocol != 'dokodemo-door';" 2>/dev/null || true
-            ok "Все пользовательские подключения успешно удалены из базы LucX"
-            return 0
-            ;;
-        3|4)
-            sqlite3 "$DB" "DELETE FROM inbounds WHERE tag != 'api' AND protocol != 'dokodemo-door';" 2>/dev/null || true
-            ok "Все пользовательские подключения удалены. Создаем чистые типовые пресеты с клиентом '1'..."
-            ;;
-        1)
-            info "Создаем типовые подключения поверх существующих с клиентом '1'..."
-            ;;
-        *)
-            warn "Неизвестный выбор, пропускаем настройку подключений"
-            return 0
-            ;;
-    esac
-
-    # Освобождаем порты перед созданием
-    systemctl stop "$XUI_SERVICE" >/dev/null 2>&1 || true
-    killall -9 xray 2>/dev/null || true
-    sleep 1
-
-    echo "Поиск и тестирование устойчивых SNI для РФ (TLS 1.3 + HTTP/2)..."
-
-    local x25519_out
-    x25519_out="$("$XRAY_BIN" x25519 2>/dev/null || true)"
-    local priv_key pub_key
-    priv_key="$(awk -F': ' '/Private key/{print $2}' <<<"$x25519_out" | tr -d ' ')"
-    pub_key="$(awk -F': ' '/Public key/{print $2}' <<<"$x25519_out" | tr -d ' ')"
-
-    local wg_priv_key="" wg_pub_key=""
-    if command -v wg >/dev/null 2>&1; then
-        wg_priv_key="$(wg genkey 2>/dev/null || true)"
-        wg_pub_key="$(echo "$wg_priv_key" | wg pubkey 2>/dev/null || true)"
-    fi
-    if [[ -z "$wg_priv_key" ]]; then
-        wg_priv_key="$priv_key"
-        wg_pub_key="$pub_key"
-    fi
-
-    python3 - "$DB" "$priv_key" "$pub_key" "$wg_priv_key" "$wg_pub_key" <<'PY'
-import sqlite3, sys, json, uuid, secrets, socket, ssl, time
-
-db_path, priv_k, pub_k, wg_priv_k, wg_pub_k = sys.argv[1:6]
-
-candidates = [
-    ("swdist.apple.com", "Apple Update CDN"),
-    ("updates.cdn-apple.com", "Apple Software CDN"),
-    ("delivery.mp.microsoft.com", "Windows Delivery Opt"),
-    ("download.windowsupdate.com", "Windows Update CDN"),
-    ("gateway.icloud.com", "Apple iCloud Gateway"),
-    ("update.samsungmobile.com", "Samsung Mobile Update"),
-    ("steampowered.com", "Valve Steam CDN"),
-    ("epicgames.com", "Epic Games CDN")
-]
-
-tested = []
-for host, desc in candidates:
-    try:
-        ctx = ssl.create_default_context()
-        ctx.set_alpn_protocols(['h2', 'http/1.1'])
-        t0 = time.time()
-        with socket.create_connection((host, 443), timeout=2.5) as sock:
-            with ctx.wrap_socket(sock, server_hostname=host) as ssock:
-                ver = ssock.version()
-                alpn = ssock.selected_alpn_protocol()
-                dt = (time.time() - t0) * 1000
-                if ver == "TLSv1.3" and alpn == "h2":
-                    tested.append((dt, host, desc))
-                    print(f"  [+] {host:<28} : TLS 1.3, h2, {dt:5.1f} ms ({desc})")
-    except Exception:
-        continue
-
-tested.sort(key=lambda x: x[0])
-if len(tested) >= 2:
-    sni_xhttp = tested[0][1]
-    sni_grpc = tested[1][1]
-elif len(tested) == 1:
-    sni_xhttp = tested[0][1]
-    sni_grpc = tested[0][1]
-else:
-    sni_xhttp = "swdist.apple.com"
-    sni_grpc = "delivery.mp.microsoft.com"
-
-print(f"\n[OK] Выбраны оптимальные SNI:")
-print(f"    • Для XHTTP: {sni_xhttp}")
-print(f"    • Для gRPC : {sni_grpc}\n")
-
-conn = sqlite3.connect(db_path)
-cur = conn.cursor()
-
-cur.execute("PRAGMA table_info(inbounds);")
-columns = [row[1] for row in cur.fetchall()]
-
-cur.execute("SELECT port FROM inbounds")
-used_db_ports = set(r[0] for r in cur.fetchall())
-
-def is_port_free(port, udp=False):
-    if port in used_db_ports:
-        return False
-    sock_type = socket.SOCK_DGRAM if udp else socket.SOCK_STREAM
-    with socket.socket(socket.AF_INET, sock_type) as s:
-        try:
-            s.bind(("0.0.0.0", port))
-            return True
-        except Exception:
-            return False
-
-def get_free_port(preferred, udp=False):
-    candidate = preferred
-    while not is_port_free(candidate, udp=udp):
-        candidate += 1
-    used_db_ports.add(candidate)
-    return candidate
-
-def insert_inbound(data_dict):
-    valid_keys = [k for k in data_dict.keys() if k in columns]
-    placeholders = ", ".join(["?"] * len(valid_keys))
-    col_names = ", ".join(valid_keys)
-    vals = [data_dict[k] for k in valid_keys]
-    cur.execute(f"INSERT INTO inbounds ({col_names}) VALUES ({placeholders})", vals)
-
-try:
-    sniff_json = json.dumps({
-        "enabled": True,
-        "destOverride": ["http", "tls", "quic"],
-        "metadataOnly": False,
-        "routeOnly": True
-    }, separators=(',', ':'))
-
-    # 1. VLESS Reality XHTTP (Клиент с именем "1")
-    port_vless_xhttp = get_free_port(443)
-    insert_inbound({
-        "user_id": 1, "up": 0, "down": 0, "total": 0,
-        "remark": f"VLESS-Reality-XHTTP-{port_vless_xhttp}",
-        "enable": 1, "port": port_vless_xhttp, "protocol": "vless",
-        "settings": json.dumps({
-            "clients": [{
-                "id": str(uuid.uuid4()), "flow": "", "email": "1",
-                "limitIp": 0, "totalGB": 0, "expiryTime": 0, "enable": True,
-                "tgId": "", "subId": secrets.token_hex(8), "reset": 0
-            }],
-            "decryption": "none", "fallbacks": []
-        }, separators=(',', ':')),
-        "stream_settings": json.dumps({
-            "network": "xhttp", "security": "reality",
-            "realitySettings": {
-                "show": False, "xver": 0, "dest": f"{sni_xhttp}:443",
-                "serverNames": [sni_xhttp],
-                "privateKey": priv_k, "minClient": "", "maxClient": "", "maxTimediff": 0,
-                "shortIds": [secrets.token_hex(8)],
-                "settings": { "publicKey": pub_k, "fingerprint": "chrome", "serverName": "", "spiderX": "/" }
-            },
-            "xhttpSettings": { "path": f"/{secrets.token_hex(4)}", "mode": "auto" }
-        }, separators=(',', ':')),
-        "tag": f"inbound-{port_vless_xhttp}", "sniffing": sniff_json, "listen": "", "expiry_time": 0
-    })
-    print(f"[OK] 1. VLESS-Reality XHTTP : порт {port_vless_xhttp} (SNI: {sni_xhttp}, Клиент: 1)")
-
-    # 2. VLESS Reality gRPC (Клиент с именем "1")
-    port_vless_grpc = get_free_port(2053)
-    insert_inbound({
-        "user_id": 1, "up": 0, "down": 0, "total": 0,
-        "remark": f"VLESS-Reality-gRPC-{port_vless_grpc}",
-        "enable": 1, "port": port_vless_grpc, "protocol": "vless",
-        "settings": json.dumps({
-            "clients": [{
-                "id": str(uuid.uuid4()), "flow": "", "email": "1",
-                "limitIp": 0, "totalGB": 0, "expiryTime": 0, "enable": True,
-                "tgId": "", "subId": secrets.token_hex(8), "reset": 0
-            }],
-            "decryption": "none", "fallbacks": []
-        }, separators=(',', ':')),
-        "stream_settings": json.dumps({
-            "network": "grpc", "security": "reality",
-            "realitySettings": {
-                "show": False, "xver": 0, "dest": f"{sni_grpc}:443",
-                "serverNames": [sni_grpc],
-                "privateKey": priv_k, "minClient": "", "maxClient": "", "maxTimediff": 0,
-                "shortIds": [secrets.token_hex(8)],
-                "settings": { "publicKey": pub_k, "fingerprint": "chrome", "serverName": "", "spiderX": "/" }
-            },
-            "grpcSettings": { "serviceName": f"grpc-{secrets.token_hex(4)}", "multiMode": False }
-        }, separators=(',', ':')),
-        "tag": f"inbound-{port_vless_grpc}", "sniffing": sniff_json, "listen": "", "expiry_time": 0
-    })
-    print(f"[OK] 2. VLESS-Reality gRPC   : порт {port_vless_grpc} (SNI: {sni_grpc}, Клиент: 1)")
-
-    # 3. AmneziaWG Kernel 3.1 Inbound
-    port_wg = get_free_port(51821, udp=True)
-    insert_inbound({
-        "user_id": 1, "up": 0, "down": 0, "total": 0,
-        "remark": f"AmneziaWG-3.1-Inbound-{port_wg}",
-        "enable": 1, "port": port_wg, "protocol": "wireguard",
-        "settings": json.dumps({
-            "secretKey": wg_priv_k,
-            "address": ["10.10.10.1/24"],
-            "peers": [{
-                "publicKey": wg_pub_k,
-                "allowedIPs": ["10.10.10.2/32"]
-            }],
-            "mtu": 1280,
-            "kernelMode": True,
-            "jc": 5, "jmin": 50, "jmax": 1000,
-            "s1": 56, "s2": 112, "s3": 140, "s4": 280,
-            "h1": 128947192, "h2": 827361928, "h3": 472819283, "h4": 918273645,
-            "randomTrailers": True
-        }, separators=(',', ':')),
-        "stream_settings": "{}",
-        "tag": f"inbound-{port_wg}", "sniffing": sniff_json, "listen": "", "expiry_time": 0
-    })
-    print(f"[OK] 3. AmneziaWG Inbound    : порт {port_wg} (UDP, Kernel 3.1, RandomTrailers)")
-
-    conn.commit()
-    print("[OK] База данных успешно обновлена новыми инбаундами и клиентом '1'")
-except Exception as e:
-    print(f"[ОШИБКА] Ошибка при добавлении в БД: {e}")
-    conn.rollback()
-    sys.exit(1)
-finally:
-    conn.close()
-PY
-
-    ok "Типовые подключения готовы"
-}
-
 backup_state() {
     section "РЕЗЕРВНЫЕ КОПИИ"
     local stamp
@@ -1010,6 +703,7 @@ use_psiphon = (use_psiphon_str == "1")
 with open(src_path, "r", encoding="utf-8") as f:
     cfg = json.load(f)
 
+# Очищаем конфигурацию от пользовательских инбаундов (они будут браться из БД LucX)
 clean_inbounds = []
 for ib in cfg.get("inbounds", []):
     tag = ib.get("tag", "")
@@ -1032,13 +726,9 @@ cfg["dns"] = {
           "geosite:google-deepmind",
           "geosite:openai",
           "geosite:anthropic",
-          "google.com",
-          "googleapis.com",
-          "googlevideo.com",
-          "ggpht.com",
-          "ytimg.com",
-          "youtubei.googleapis.com",
-          "consent.youtube.com"
+          "google.com", "googleapis.com", "googlevideo.com", "ggpht.com",
+          "ytimg.com", "youtubei.googleapis.com", "consent.youtube.com",
+          "youtube.com", "youtu.be"
         ],
         "expectedIPs": [],
         "unexpectedIPs": [],
@@ -1059,13 +749,9 @@ cfg["dns"] = {
           "geosite:google-deepmind",
           "geosite:openai",
           "geosite:anthropic",
-          "google.com",
-          "googleapis.com",
-          "googlevideo.com",
-          "ggpht.com",
-          "ytimg.com",
-          "youtubei.googleapis.com",
-          "consent.youtube.com"
+          "google.com", "googleapis.com", "googlevideo.com", "ggpht.com",
+          "ytimg.com", "youtubei.googleapis.com", "consent.youtube.com",
+          "youtube.com", "youtu.be"
         ],
         "expectedIPs": [],
         "unexpectedIPs": [],
@@ -1175,11 +861,10 @@ add_rule({
     "outboundTag": "direct"
 })
 
-# 2. Перехват DNS запросов (порт 53) -> dns-out
+# 2. Перехват ВСЕХ DNS запросов (любой IP, порт 53) -> dns-out
 add_rule({
     "type": "field",
     "enabled": True,
-    "ip": ["1.1.1.1", "1.0.0.1"],
     "port": "53",
     "network": "tcp,udp",
     "outboundTag": "dns-out"
@@ -1348,6 +1033,32 @@ start_lucx() {
     die "x-ui не ACTIVE"
 }
 
+# --- АВТОМАТИЧЕСКИЙ ВЫПУСК SSL ДЛЯ IP ---
+
+setup_ip_ssl() {
+    section "НАСТРОЙКА SSL-СЕРТИФИКАТА ДЛЯ IP"
+
+    local cert_file
+    cert_file="$(sqlite3 "$DB" "SELECT value FROM settings WHERE key='webCertFile';" 2>/dev/null || true)"
+
+    if [[ -n "$cert_file" && -f "$cert_file" ]]; then
+        ok "SSL-сертификат для панели уже настроен ($cert_file)"
+        return 0
+    fi
+
+    info "Получение SSL для IP через Let's Encrypt (3X-UI)..."
+    local cmd="x-ui"
+    if ! command -v x-ui >/dev/null 2>&1 && [[ -x /usr/local/x-ui/x-ui.sh ]]; then
+        cmd="/usr/local/x-ui/x-ui.sh"
+    fi
+
+    printf "20\n6\ny\n\n\n\ny\n\n0\n0\n" | $cmd >/dev/null 2>&1 || true
+
+    systemctl restart "$XUI_SERVICE" >/dev/null 2>&1 || true
+    xui_wait_active 15 || true
+    ok "SSL-сертификат для IP успешно применён к панели"
+}
+
 # --- ПОЛУЧЕНИЕ ПАРАМЕТРОВ ДОСТУПА И СБРОС УЧЁТНЫХ ДАННЫХ ---
 
 print_panel_credentials() {
@@ -1369,7 +1080,6 @@ print_panel_credentials() {
         url_raw="$(grep -iE 'https?://' <<< "$setting_raw" | grep -oE 'https?://[^ ]+' | head -n1)"
     fi
 
-    # Вывод блока настроек БЕЗ строки с адресом
     if [[ -n "$setting_raw" ]]; then
         grep -viE 'Access URL|http://|https://' <<< "$setting_raw" || true
         echo
@@ -1448,12 +1158,12 @@ main() {
     check_psiphon
     backup_state
 
-    manage_inbounds_xtuna
-
     generate_xray_config
     test_xray_config
     persist_xray_safe
     start_lucx
+
+    setup_ip_ssl
 
     section "ГОТОВО"
     echo "WARP backend  : $WARP_BACKEND"
@@ -1467,11 +1177,11 @@ main() {
     echo "DNS-модуль    : Интегрирован (upstream/dns-out)"
     echo "RU-трафик     : BLOCKED / BLACKHOLE"
     echo "Шаблон Xray   : ПРИМЕНЕН БЕЗОПАСНО"
-    echo "Подключения   : VLESS Reality (XHTTP, gRPC) с клиентом '1' и AmneziaWG Kernel 3.1"
+    echo "Подключения   : Не генерировались скриптом (создайте вручную в панели)"
     echo
     print_panel_credentials
     echo
-    ok "Установка и настройка успешно завершены!"
+    ok "Установка и базовая настройка успешно завершены!"
 }
 
 main "$@"
