@@ -1,0 +1,1480 @@
+cat <<'EOF' > /root/warp-psiphon-setup.sh
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+export DEBIAN_FRONTEND=noninteractive
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+BASE="/root/warp-psiphon-setup"
+DB="/etc/x-ui/x-ui.db"
+XRAY_BIN="/usr/local/x-ui/bin/xray-linux-amd64"
+XRAY_RUNTIME="/usr/local/x-ui/bin/config.json"
+XUI_SERVICE="x-ui"
+
+USE_PSIPHON=1
+PSIPHON_PORT="1080"
+PSIPHON_SOCKS="172.17.0.1:1080"
+PSIPHON_REGION="AUTO"
+
+AWG_IFACE=""
+AWG_CONFIG=""
+AWG_SOURCE_CONFIG=""
+WARP_BACKEND="none"
+WARP_OK=0
+XRAY_GENERATED=""
+
+VPS_WARP_INSTALL_URL="https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh"
+PSIPHON_INSTALL_URL="https://raw.githubusercontent.com/Chara-Freedom/vps-psiphon/main/psiphon_install.sh"
+AWG_API_URL="https://valokda-amnezia.vercel.app/api/warp"
+
+mkdir -p "$BASE" "$BASE/backup"
+chmod 700 "$BASE"
+
+LOG="$BASE/setup.log"
+exec > >(tee -a "$LOG") 2>&1
+
+GREEN="\033[1;32m"
+YELLOW="\033[1;33m"
+RED="\033[1;31m"
+CYAN="\033[1;36m"
+RESET="\033[0m"
+
+ok()   { echo -e "${GREEN}[OK]${RESET} $*"; }
+warn() { echo -e "${YELLOW}[WARN]${RESET} $*"; }
+die()  { echo -e "${RED}[ОШИБКА]${RESET} $*"; exit 1; }
+info() { echo -e "${CYAN}$*${RESET}"; }
+
+section() {
+    echo
+    echo "============================================================"
+    echo "$*"
+    echo "============================================================"
+    echo
+}
+
+# --- ДИАГНОСТИКА ТУННЕЛЕЙ В ЯДРЕ ---
+
+get_active_normal_warp() {
+    if ip link show warp >/dev/null 2>&1; then
+        if curl -4fsS --interface warp --max-time 6 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -q 'warp='; then
+            echo "warp"
+            return 0
+        fi
+    fi
+    return 1
+}
+
+get_active_awg_interface() {
+    local ifaces
+    local iface
+    ifaces="$(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | grep -E '^awgo-' || true)"
+    for iface in $ifaces; do
+        if curl -4fsS --interface "$iface" --max-time 6 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -q 'warp='; then
+            echo "$iface"
+            return 0
+        fi
+    done
+    return 1
+}
+
+heal_policy_routing() {
+    local dev="$1"
+    ip rule add fwmark 255 table 51820 priority 100 2>/dev/null || true
+    ip route replace default dev "$dev" table 51820
+    ok "Маршрутизация (fwmark 255 -> table 51820 -> $dev) активна"
+}
+
+# --- ВЗАИМНАЯ ОЧИСТКА ---
+
+cleanup_normal_warp() {
+    section "ОЧИСТКА ОБЫЧНОГО WARP"
+    if command -v vps-warp >/dev/null 2>&1; then
+        vps-warp off >/dev/null 2>&1 || true
+    fi
+    systemctl stop wg-quick@warp >/dev/null 2>&1 || true
+    systemctl disable wg-quick@warp >/dev/null 2>&1 || true
+    ip link del warp >/dev/null 2>&1 || true
+    ip route del default dev warp table 51820 >/dev/null 2>&1 || true
+    ok "Обычный WARP полностью отключен"
+}
+
+cleanup_awg_warp() {
+    section "ОЧИСТКА РЕЗЕРВНОГО WARP (AWG 2.0)"
+    local srv
+    for srv in $(systemctl list-unit-files 'awg-quick@*' --no-legend 2>/dev/null | awk '{print $1}' || true); do
+        systemctl disable --now "$srv" >/dev/null 2>&1 || true
+    done
+
+    local awg_links
+    local iface
+    awg_links="$(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | grep -E '^awgo-' || true)"
+    for iface in $awg_links; do
+        awg-quick down "$iface" >/dev/null 2>&1 || true
+        ip link del "$iface" >/dev/null 2>&1 || true
+        ip route del default dev "$iface" table 51820 >/dev/null 2>&1 || true
+    done
+
+    rm -f /etc/amnezia/amneziawg/awgo-*.conf 2>/dev/null || true
+
+    if [[ -f "$DB" ]] && command -v sqlite3 >/dev/null 2>&1; then
+        sqlite3 "$DB" "DELETE FROM awg_outbounds WHERE tag='warp-out' OR remark='WARP AWG 2.0 fallback';" 2>/dev/null || true
+    fi
+    ok "Резервный AWG полностью отключен"
+}
+
+cleanup_firewall_rules() {
+    iptables -D OUTPUT -m mark ! --mark 255 -p tcp -j REJECT >/dev/null 2>&1 || true
+    iptables -D OUTPUT -m mark ! --mark 255 -p udp -j REJECT >/dev/null 2>&1 || true
+}
+
+# --- СИСТЕМНЫЕ ЗАВИСИМОСТИ ---
+
+install_minimal() {
+    section "1/6 ПОДГОТОВКА СИСТЕМЫ"
+    apt-get update -y >/dev/null 2>&1
+    apt-get install -y curl ca-certificates >/dev/null 2>&1
+    ok "Базовые пакеты проверены"
+}
+
+install_lucx() {
+    section "УСТАНОВКА LUCX-UI"
+    if [[ -x /usr/local/x-ui/x-ui ]] && systemctl cat "$XUI_SERVICE" >/dev/null 2>&1; then
+        ok "LucX уже установлен — пропускаем"
+        return 0
+    fi
+    echo "Устанавливаем LucX..."
+    curl -fsSL https://raw.githubusercontent.com/AlexeyLCP/lucx-ui/main/install.sh | bash
+    systemctl daemon-reload
+    [[ -x /usr/local/x-ui/x-ui ]] || die "LucX не установлен"
+    ok "LucX установлен"
+}
+
+install_dependencies() {
+    section "ЗАВИСИМОСТИ"
+    apt-get update -y >/dev/null 2>&1
+    apt-get install -y \
+        jq sqlite3 iproute2 iptables iptables-persistent \
+        wireguard-tools unzip xz-utils socat procps \
+        net-tools curl ca-certificates python3 coreutils openssl psmisc >/dev/null 2>&1
+
+    if ! command -v docker >/dev/null 2>&1; then
+        curl -fsSL https://get.docker.com | sh
+    fi
+    systemctl enable --now docker >/dev/null 2>&1 || true
+    ok "Зависимости готовы"
+}
+
+xui_wait_active() {
+    local max="${1:-30}"
+    local i
+    for ((i=1; i<=max; i++)); do
+        echo "    LucX: $i/$max сек..."
+        if systemctl is-active --quiet "$XUI_SERVICE"; then
+            ok "LucX ACTIVE"
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+# --- УСТАНОВКА ОБЫЧНОГО WARP ---
+
+install_normal_warp() {
+    section "УСТАНОВКА ОБЫЧНОГО WARP"
+    if get_active_normal_warp >/dev/null; then
+        ok "Существующий WARP уже работает — переустановка не нужна"
+        vps-warp status 2>/dev/null || true
+        heal_policy_routing "warp"
+        return 0
+    fi
+
+    echo "Скачиваем и запускаем установщик vps-warp..."
+    local installer="$BASE/warp_install.sh"
+    if ! curl -fL --connect-timeout 10 --max-time 30 "$VPS_WARP_INSTALL_URL" -o "$installer"; then
+        warn "Не удалось скачать установщик vps-warp"
+        return 1
+    fi
+
+    chmod +x "$installer"
+    if ! bash "$installer"; then
+        warn "Установщик vps-warp завершился с ошибкой"
+        return 1
+    fi
+
+    echo "Проверяем подключение WARP..."
+    local i
+    for ((i=1; i<=20; i++)); do
+        echo "    WARP: $i/20 сек..."
+        if get_active_normal_warp >/dev/null; then
+            ok "Обычный WARP успешно подключен"
+            heal_policy_routing "warp"
+            vps-warp status 2>/dev/null || true
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+# --- УСТАНОВКА AWG 2.0 (OUTBOUND) ---
+
+load_awg_module() {
+    modprobe amneziawg >/dev/null 2>&1 || true
+    if [[ -d /sys/module/amneziawg ]]; then return 0; fi
+
+    local manager=""
+    if [[ -x /usr/bin/x-ui ]]; then manager="/usr/bin/x-ui"
+    elif [[ -x /usr/local/x-ui/bin/install-awg-module.sh ]]; then manager="/usr/local/x-ui/bin/install-awg-module.sh"; fi
+
+    if [[ -n "$manager" ]]; then
+        if [[ "$(basename "$manager")" == "x-ui" ]]; then "$manager" install-awg || true
+        else bash "$manager" || true; fi
+    fi
+
+    modprobe amneziawg >/dev/null 2>&1 || true
+    [[ -d /sys/module/amneziawg ]] && return 0
+    return 1
+}
+
+extract_conf_value() {
+    local key="$1"
+    local file="$2"
+    awk -F'=' -v k="$key" '
+        BEGIN { IGNORECASE=1 }
+        /^[[:space:]]*#/ { next }
+        {
+            lhs=$1; gsub(/[[:space:]]/, "", lhs)
+            if (lhs == k) {
+                $1=""; sub(/^[[:space:]]*=[[:space:]]*/, ""); gsub(/[[:space:]]+$/, ""); print; exit
+            }
+        }
+    ' "$file"
+}
+
+normalize_b64_key() {
+    local val="$1"
+    python3 - "$val" <<'PY'
+import sys, base64
+val = sys.argv[1].strip()
+if not val: raise SystemExit(2)
+val += "=" * ((4 - len(val) % 4) % 4)
+try: raw = base64.b64decode(val, validate=True)
+except Exception: raise SystemExit(2)
+if len(raw) != 32: raise SystemExit(2)
+print(base64.b64encode(raw).decode("ascii"))
+PY
+}
+
+validate_awg_conf_keys() {
+    local file="$1"
+    local private public psk
+
+    private="$(extract_conf_value PrivateKey "$file")"
+    public="$(extract_conf_value PublicKey "$file")"
+    psk="$(extract_conf_value PresharedKey "$file")"
+
+    [[ -n "$private" && -n "$public" ]] || return 1
+    normalize_b64_key "$private" >/dev/null || return 1
+    normalize_b64_key "$public" >/dev/null || return 1
+    if [[ -n "$psk" ]]; then normalize_b64_key "$psk" >/dev/null || return 1; fi
+    return 0
+}
+
+normalize_conf_keys_in_place() {
+    local file="$1"
+    local tmp
+    tmp="${file}.normalized"
+
+    python3 - "$file" "$tmp" <<'PY'
+import sys, base64, re
+src, dst = sys.argv[1:3]
+def norm(v):
+    v = v.strip() + "=" * ((4 - len(v.strip()) % 4) % 4)
+    try: r = base64.b64decode(v, validate=True)
+    except Exception: return None
+    return base64.b64encode(r).decode("ascii") if len(r) == 32 else None
+
+with open(src, "r", encoding="utf-8") as f: lines = f.readlines()
+out = []
+for l in lines:
+    m = re.match(r'^(\s*)(PrivateKey|PublicKey|PresharedKey)(\s*=\s*)(.*?)\s*$', l, flags=re.I)
+    if not m: out.append(l); continue
+    p, k, s, v = m.groups()
+    nv = norm(v)
+    if nv is None: raise SystemExit(2)
+    out.append(f"{p}{k}{s}{nv}\n")
+with open(dst, "w", encoding="utf-8") as f: f.writelines(out)
+PY
+    mv "$tmp" "$file"
+    chmod 600 "$file"
+}
+
+download_awg_config() {
+    section "AWG 2.0 — ПОЛУЧЕНИЕ КОНФИГА (OUTBOUND)"
+    mkdir -p /etc/amnezia/amneziawg
+    local out="$BASE/warp-awg2-$(date +%Y%m%d-%H%M%S).conf"
+    local raw="$BASE/warp-awg2-response-$(date +%Y%m%d-%H%M%S).json"
+    local ua="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/140 Safari/537.36"
+    local attempt
+
+    for attempt in 1 2 3 4 5; do
+        rm -f "$raw"
+        if curl -fsS --connect-timeout 10 --max-time 45 --retry 1 --retry-delay 2 \
+            -A "$ua" -H "Accept: application/json" -H "Content-Type: application/json" -X POST \
+            --data '{"mode":"awg2","template":"warp_amnezia_awg2","dns":"cloudflare"}' \
+            "$AWG_API_URL" -o "$raw" >/dev/null 2>&1; then
+            if jq -e '.success == true and (.content | type == "string")' "$raw" >/dev/null 2>&1; then
+                if jq -r '.content' "$raw" | base64 -d > "$out" 2>/dev/null; then
+                    if grep -q '^\[Interface\]' "$out" && grep -q '^\[Peer\]' "$out"; then
+                        if normalize_conf_keys_in_place "$out" && validate_awg_conf_keys "$out"; then
+                            ok "AWG 2.0 конфиг получен и проверен"
+                            AWG_SOURCE_CONFIG="$out"
+                            return 0
+                        fi
+                    fi
+                fi
+            fi
+        fi
+        sleep 3
+    done
+    return 1
+}
+
+prepare_awg_config() {
+    local src="$AWG_SOURCE_CONFIG"
+    local id
+    id="$(date +%s)"
+    AWG_IFACE="awgo-$id"
+    AWG_CONFIG="/etc/amnezia/amneziawg/${AWG_IFACE}.conf"
+
+    local private address mtu dns public psk allowed endpoint keepalive k v
+
+    private="$(extract_conf_value PrivateKey "$src")"
+    address="$(extract_conf_value Address "$src")"
+    mtu="$(extract_conf_value MTU "$src")"
+    dns="$(extract_conf_value DNS "$src")"
+    public="$(extract_conf_value PublicKey "$src")"
+    psk="$(extract_conf_value PresharedKey "$src")"
+    allowed="$(extract_conf_value AllowedIPs "$src")"
+    endpoint="$(extract_conf_value Endpoint "$src")"
+    keepalive="$(extract_conf_value PersistentKeepalive "$src")"
+
+    [[ -n "$private" && -n "$public" ]] || return 1
+    [[ -n "$address" ]] || address="172.16.0.2/32"
+    [[ -n "$mtu" ]] || mtu="1280"
+    [[ -n "$allowed" ]] || allowed="0.0.0.0/0"
+    [[ -n "$keepalive" ]] || keepalive="25"
+
+    private="$(normalize_b64_key "$private")" || return 1
+    public="$(normalize_b64_key "$public")" || return 1
+    if [[ -n "$psk" ]]; then psk="$(normalize_b64_key "$psk")" || return 1; fi
+
+    {
+        echo "[Interface]"
+        echo "PrivateKey = $private"
+        echo "Address = $address"
+        echo "MTU = $mtu"
+        echo "Table = off"
+        echo "PostUp = ip rule add fwmark 255 table 51820 priority 100 2>/dev/null || true; ip route replace default dev %i table 51820"
+        echo "PostDown = ip rule del fwmark 255 table 51820 2>/dev/null || true; ip route flush table 51820 2>/dev/null || true"
+        [[ -n "$dns" ]] && echo "# DNS = $dns"
+        for k in Jc Jmin Jmax S1 S2 S3 S4 H1 H2 H3 H4 I1 I2 I3 I4 I5; do
+            v="$(extract_conf_value "$k" "$src")"
+            [[ -n "$v" ]] && echo "$k = $v"
+        done
+        echo
+        echo "[Peer]"
+        echo "PublicKey = $public"
+        [[ -n "$psk" ]] && echo "PresharedKey = $psk"
+        echo "AllowedIPs = $allowed"
+        echo "Endpoint = $endpoint"
+        echo "PersistentKeepalive = $keepalive"
+    } > "$AWG_CONFIG"
+    chmod 600 "$AWG_CONFIG"
+    validate_awg_conf_keys "$AWG_CONFIG" || die "AWG ключи некорректны"
+}
+
+setup_awg_interface() {
+    awg-quick down "$AWG_CONFIG" >/dev/null 2>&1 || true
+    ip link del "$AWG_IFACE" >/dev/null 2>&1 || true
+
+    if ! awg-quick up "$AWG_CONFIG"; then return 1; fi
+    systemctl enable "awg-quick@$AWG_IFACE.service" >/dev/null 2>&1 || true
+
+    local up=0
+    local i
+    for ((i=1; i<=15; i++)); do
+        if ip link show "$AWG_IFACE" >/dev/null 2>&1; then up=1; break; fi
+        sleep 1
+    done
+    [[ "$up" == "1" ]] || return 1
+
+    local trace
+    trace="$(timeout 20 curl -4fsS --interface "$AWG_IFACE" --max-time 15 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)"
+    [[ -n "$trace" ]] || return 1
+    heal_policy_routing "$AWG_IFACE"
+    return 0
+}
+
+setup_awg() {
+    load_awg_module || return 1
+    download_awg_config || return 1
+    prepare_awg_config || return 1
+    setup_awg_interface || return 1
+    WARP_BACKEND="awg"
+    WARP_OK=1
+    return 0
+}
+
+# --- МЕНЕДЖЕР ВЫБОРА WARP ---
+
+manage_warp() {
+    section "УПРАВЛЕНИЕ И ВЫБОР РЕЖИМА WARP"
+
+    local active_normal=""
+    local active_awg=""
+
+    active_normal="$(get_active_normal_warp || true)"
+    active_awg="$(get_active_awg_interface || true)"
+
+    echo "Текущий статус туннелей WARP на сервере:"
+    if [[ -n "$active_normal" ]]; then
+        ok "Обнаружен активный [Обычный WARP] (интерфейс: $active_normal)"
+    fi
+    if [[ -n "$active_awg" ]]; then
+        ok "Обнаружен активный [Резервный WARP AWG 2.0] (интерфейс: $active_awg)"
+    fi
+    if [[ -z "$active_normal" && -z "$active_awg" ]]; then
+        warn "Активный рабочий туннель WARP не найден"
+    fi
+    echo
+
+    local choice=""
+    if [[ -n "$active_normal" || -n "$active_awg" ]]; then
+        echo "0) Оставить текущий рабочий WARP (восстановит маршруты без переустановки)"
+        echo "1) Использовать / переустановить Обычный WARP (удалит резервный AWG)"
+        echo "2) Использовать / переустановить Резервный AWG 2.0 (удалит обычный WARP)"
+        echo
+        read -rp "Выберите действие [0/1/2, Enter=0]: " choice
+        choice="${choice:-0}"
+    else
+        echo "1) Установить Обычный WARP (vps-warp)"
+        echo "2) Установить Резервный WARP (AWG 2.0)"
+        echo "0) Пропустить настройку WARP (без WARP)"
+        echo
+        read -rp "Выберите действие [1/2/0, Enter=1]: " choice
+        choice="${choice:-1}"
+    fi
+
+    case "$choice" in
+        0)
+            if [[ -n "$active_awg" ]]; then
+                ok "Сохраняем текущий AWG ($active_awg)"
+                AWG_IFACE="$active_awg"
+                heal_policy_routing "$active_awg"
+                cleanup_normal_warp >/dev/null 2>&1 || true
+                WARP_BACKEND="awg"
+                WARP_OK=1
+            elif [[ -n "$active_normal" ]]; then
+                ok "Сохраняем текущий Обычный WARP ($active_normal)"
+                heal_policy_routing "$active_normal"
+                cleanup_awg_warp >/dev/null 2>&1 || true
+                WARP_BACKEND="normal"
+                WARP_OK=1
+            else
+                info "Работа продолжится без WARP"
+                WARP_BACKEND="none"
+                WARP_OK=0
+            fi
+            ;;
+        1)
+            cleanup_awg_warp
+            if install_normal_warp; then
+                WARP_BACKEND="normal"
+                WARP_OK=1
+            else
+                die "Не удалось запустить Обычный WARP"
+            fi
+            ;;
+        2)
+            cleanup_normal_warp
+            cleanup_awg_warp
+            if setup_awg; then
+                WARP_BACKEND="awg"
+                WARP_OK=1
+            else
+                die "Не удалось запустить Резервный AWG"
+            fi
+            ;;
+        *)
+            warn "Неизвестный пункт, продолжаем без изменений"
+            WARP_BACKEND="none"
+            WARP_OK=0
+            ;;
+    esac
+}
+
+# --- НАСТРОЙКА И УПРАВЛЕНИЕ PSIPHON ---
+
+psiphon_local_listener() {
+    ss -lntp 2>/dev/null | awk -v port=":$PSIPHON_PORT" 'NR > 1 && $1 == "LISTEN" && index($4, port) > 0 { print $4; exit }'
+}
+
+psiphon_local_addr() {
+    awk '{ x=$0; sub(/:[0-9]+$/, "", x); gsub(/^\[|\]$/, "", x); print x }' <<<"$1"
+}
+
+get_active_psiphon_trace() {
+    local socks="172.17.0.1:${PSIPHON_PORT}"
+    local listener
+    listener="$(psiphon_local_listener)"
+    [[ -n "$listener" ]] || return 1
+
+    local addr
+    addr="$(psiphon_local_addr "$listener")"
+    case "$addr" in 0.0.0.0|::|"") return 1 ;; esac
+
+    local trace
+    trace="$(timeout 10 curl -4fsS --proxy "socks5h://$socks" --max-time 8 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)"
+    if grep -q 'ip=' <<<"$trace"; then
+        echo "$trace"
+        return 0
+    fi
+    return 1
+}
+
+choose_psiphon_region() {
+    echo "Выберите регион выхода Psiphon:"
+    echo "  AUTO — автоматически (рекомендуется)"
+    echo "  DE  NL  FI  SE  FR  GB  US  CA"
+    echo
+    read -rp "Регион [AUTO]: " PSIPHON_REGION
+    PSIPHON_REGION="${PSIPHON_REGION:-AUTO}"
+    PSIPHON_REGION="$(echo "$PSIPHON_REGION" | tr -d ' ')"
+}
+
+install_psiphon_core() {
+    choose_psiphon_region
+
+    echo "Устанавливаем / перезапускаем Psiphon..."
+    local psiphon_args=("--socks-port" "$PSIPHON_PORT" "--no-http")
+    if [[ "${PSIPHON_REGION^^}" != "AUTO" ]]; then
+        psiphon_args+=("--region" "${PSIPHON_REGION^^}")
+    fi
+
+    docker rm -f vps-psiphon >/dev/null 2>&1 || true
+
+    if ! timeout 150 bash <(curl -fsSL "$PSIPHON_INSTALL_URL") "${psiphon_args[@]}"; then
+        warn "Установка Psiphon завершилась ошибкой"
+        return 1
+    fi
+
+    local i
+    for ((i=1; i<=25; i++)); do
+        echo "    Psiphon: $i/25 сек..."
+        if get_active_psiphon_trace >/dev/null; then
+            ok "Psiphon HTTPS работает"
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+manage_psiphon() {
+    section "УПРАВЛЕНИЕ И ВЫБОР РЕЖИМА PSIPHON"
+
+    local trace=""
+    trace="$(get_active_psiphon_trace || true)"
+
+    if [[ -n "$trace" ]]; then
+        local ip loc
+        ip="$(awk -F= '$1=="ip"{print $2}' <<<"$trace" | head -n1)"
+        loc="$(awk -F= '$1=="loc"{print $2}' <<<"$trace" | head -n1)"
+
+        ok "Обнаружен активный рабочий Psiphon"
+        echo "    SOCKS: $PSIPHON_SOCKS"
+        echo "    Exit IP: ${ip:-unknown}"
+        echo "    Country: ${loc:-unknown}"
+        echo
+
+        echo "0) Оставить текущий рабочий Psiphon (пропустить переустановку)"
+        echo "1) Переустановить / сменить регион Psiphon"
+        echo "2) Отключить Psiphon (не использовать, Google/OpenAI/Anthropic пойдут напрямую)"
+        echo
+        local choice=""
+        read -rp "Выберите действие [0/1/2, Enter=0]: " choice
+        choice="${choice:-0}"
+
+        case "$choice" in
+            0)
+                ok "Сохраняем текущий рабочий Psiphon"
+                USE_PSIPHON=1
+                return 0
+                ;;
+            1)
+                if ! install_psiphon_core; then
+                    die "Psiphon не удалось запустить"
+                fi
+                USE_PSIPHON=1
+                return 0
+                ;;
+            2)
+                info "Отключаем Psiphon..."
+                docker rm -f vps-psiphon >/dev/null 2>&1 || true
+                USE_PSIPHON=0
+                ok "Psiphon отключен. Сервисы пойдут напрямую (direct, в обход WARP)"
+                return 0
+                ;;
+            *)
+                warn "Неизвестный выбор, оставляем текущий Psiphon"
+                USE_PSIPHON=1
+                return 0
+                ;;
+        esac
+    else
+        warn "Активный рабочий Psiphon не обнаружен"
+        echo
+        echo "1) Установить Psiphon"
+        echo "0) Пропустить установку Psiphon (не использовать, Google/OpenAI/Anthropic пойдут напрямую)"
+        echo
+        local choice=""
+        read -rp "Выберите действие [1/0, Enter=1]: " choice
+        choice="${choice:-1}"
+
+        if [[ "$choice" == "0" ]]; then
+            info "Psiphon пропущен пользователем. Сервисы пойдут напрямую (direct, в обход WARP)"
+            docker rm -f vps-psiphon >/dev/null 2>&1 || true
+            USE_PSIPHON=0
+            return 0
+        fi
+
+        if ! install_psiphon_core; then
+            die "Psiphon не удалось запустить"
+        fi
+        USE_PSIPHON=1
+    fi
+}
+
+check_psiphon() {
+    if [[ "${USE_PSIPHON:-1}" == "0" ]]; then
+        info "Psiphon отключен пользователем — проверка SOCKS пропущена"
+        return 0
+    fi
+
+    section "ПРОВЕРКА SOCKS PSIPHON"
+    local test
+    test="$(timeout 15 curl -4fsS --proxy "socks5h://$PSIPHON_SOCKS" --max-time 12 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)"
+    [[ -n "$test" ]] || die "Psiphon SOCKS не передаёт HTTPS"
+    local ip loc
+    ip="$(awk -F= '$1=="ip"{print $2}' <<<"$test" | head -n1)"
+    loc="$(awk -F= '$1=="loc"{print $2}' <<<"$test" | head -n1)"
+    ok "Psiphon передаёт HTTPS"
+    echo "    Exit IP: ${ip:-unknown}"
+    echo "    Country: ${loc:-unknown}"
+}
+
+# ==============================================================================
+# БЛОК ГЕНЕРАЦИИ ВХОДЯЩИХ ПОДКЛЮЧЕНИЙ (INBOUNDS) И КЛИЕНТА "1"
+# ==============================================================================
+
+cleanup_broken_inbounds() {
+    if [[ -f "$DB" ]] && command -v sqlite3 >/dev/null 2>&1; then
+        sqlite3 "$DB" "DELETE FROM inbounds WHERE protocol='vless' AND (stream_settings LIKE '%\"privateKey\":\"\"%' OR stream_settings NOT LIKE '%privateKey%');" 2>/dev/null || true
+        sqlite3 "$DB" "UPDATE inbounds SET stream_settings='{}' WHERE protocol='wireguard' OR stream_settings LIKE '%\"network\":\"udp\"%';" 2>/dev/null || true
+        sqlite3 "$DB" "DELETE FROM inbounds WHERE id NOT IN (SELECT MIN(id) FROM inbounds GROUP BY port);" 2>/dev/null || true
+    fi
+}
+
+manage_inbounds_xtuna() {
+    section "ТИПОВЫЕ ВХОДЯЩИЕ ПОДКЛЮЧЕНИЯ (INBOUNDS)"
+    info "Генерация пресетов: VLESS Reality XHTTP, VLESS Reality gRPC, AmneziaWG Kernel 3.1"
+    echo
+
+    cleanup_broken_inbounds
+
+    [[ -f "$DB" ]] || return 0
+
+    local check_result
+    check_result="$(python3 - "$DB" <<'PY'
+import sqlite3, sys
+
+conn = sqlite3.connect(sys.argv[1])
+cur = conn.cursor()
+cur.execute("SELECT port, remark, protocol, settings, stream_settings FROM inbounds")
+rows = cur.fetchall()
+
+xhttp = ""
+grpc = ""
+awg = ""
+
+for port, remark, proto, sett, stream in rows:
+    r = (remark or "").lower()
+    s = (sett or "").lower()
+    st = (stream or "").lower()
+
+    if proto == "vless" and "xhttp" in st:
+        xhttp = str(port)
+    elif proto == "vless" and "grpc" in st:
+        grpc = str(port)
+    elif proto == "wireguard":
+        awg = str(port)
+
+if xhttp and grpc and awg:
+    print(f"ALL|{xhttp}|{grpc}|{awg}")
+else:
+    print(f"PARTIAL|{xhttp}|{grpc}|{awg}")
+conn.close()
+PY
+)"
+
+    local status p_xhttp p_grpc p_awg
+    IFS='|' read -r status p_xhttp p_grpc p_awg <<< "$check_result"
+
+    if [[ "$status" == "ALL" ]]; then
+        ok "Все 3 типовых подключения уже настроены и работают в LucX:"
+        echo "    • VLESS Reality XHTTP : порт $p_xhttp"
+        echo "    • VLESS Reality gRPC  : порт $p_grpc"
+        echo "    • AmneziaWG Kernel 3.1 : порт $p_awg"
+        echo
+    else
+        local current_inbounds_count=0
+        current_inbounds_count="$(sqlite3 "$DB" "SELECT count(*) FROM inbounds WHERE tag != 'api' AND protocol != 'dokodemo-door';" 2>/dev/null || echo 0)"
+        info "В панели настроено подключений: $current_inbounds_count"
+        echo
+    fi
+
+    echo "0) Пропустить"
+    echo "1) Создать типовые пресеты"
+    echo "2) Очистить пресеты"
+    echo "3) Очистить и создать типовые пресеты"
+    echo
+    local in_choice=""
+    read -rp "Выберите действие [0/1/2/3, Enter=0]: " in_choice
+    in_choice="${in_choice:-0}"
+
+    case "$in_choice" in
+        0)
+            ok "Подключения сохранены без изменений"
+            return 0
+            ;;
+        2)
+            sqlite3 "$DB" "DELETE FROM inbounds WHERE tag != 'api' AND protocol != 'dokodemo-door';" 2>/dev/null || true
+            ok "Все пользовательские подключения успешно удалены из базы LucX"
+            return 0
+            ;;
+        3|4)
+            sqlite3 "$DB" "DELETE FROM inbounds WHERE tag != 'api' AND protocol != 'dokodemo-door';" 2>/dev/null || true
+            ok "Все пользовательские подключения удалены. Создаем чистые типовые пресеты с клиентом '1'..."
+            ;;
+        1)
+            info "Создаем типовые подключения поверх существующих с клиентом '1'..."
+            ;;
+        *)
+            warn "Неизвестный выбор, пропускаем настройку подключений"
+            return 0
+            ;;
+    esac
+
+    # Освобождаем порты перед созданием
+    systemctl stop "$XUI_SERVICE" >/dev/null 2>&1 || true
+    killall -9 xray 2>/dev/null || true
+    sleep 1
+
+    echo "Поиск и тестирование устойчивых SNI для РФ (TLS 1.3 + HTTP/2)..."
+
+    local x25519_out
+    x25519_out="$("$XRAY_BIN" x25519 2>/dev/null || true)"
+    local priv_key pub_key
+    priv_key="$(awk -F': ' '/Private key/{print $2}' <<<"$x25519_out" | tr -d ' ')"
+    pub_key="$(awk -F': ' '/Public key/{print $2}' <<<"$x25519_out" | tr -d ' ')"
+
+    local wg_priv_key="" wg_pub_key=""
+    if command -v wg >/dev/null 2>&1; then
+        wg_priv_key="$(wg genkey 2>/dev/null || true)"
+        wg_pub_key="$(echo "$wg_priv_key" | wg pubkey 2>/dev/null || true)"
+    fi
+    if [[ -z "$wg_priv_key" ]]; then
+        wg_priv_key="$priv_key"
+        wg_pub_key="$pub_key"
+    fi
+
+    python3 - "$DB" "$priv_key" "$pub_key" "$wg_priv_key" "$wg_pub_key" <<'PY'
+import sqlite3, sys, json, uuid, secrets, socket, ssl, time
+
+db_path, priv_k, pub_k, wg_priv_k, wg_pub_k = sys.argv[1:6]
+
+candidates = [
+    ("swdist.apple.com", "Apple Update CDN"),
+    ("updates.cdn-apple.com", "Apple Software CDN"),
+    ("delivery.mp.microsoft.com", "Windows Delivery Opt"),
+    ("download.windowsupdate.com", "Windows Update CDN"),
+    ("gateway.icloud.com", "Apple iCloud Gateway"),
+    ("update.samsungmobile.com", "Samsung Mobile Update"),
+    ("steampowered.com", "Valve Steam CDN"),
+    ("epicgames.com", "Epic Games CDN")
+]
+
+tested = []
+for host, desc in candidates:
+    try:
+        ctx = ssl.create_default_context()
+        ctx.set_alpn_protocols(['h2', 'http/1.1'])
+        t0 = time.time()
+        with socket.create_connection((host, 443), timeout=2.5) as sock:
+            with ctx.wrap_socket(sock, server_hostname=host) as ssock:
+                ver = ssock.version()
+                alpn = ssock.selected_alpn_protocol()
+                dt = (time.time() - t0) * 1000
+                if ver == "TLSv1.3" and alpn == "h2":
+                    tested.append((dt, host, desc))
+                    print(f"  [+] {host:<28} : TLS 1.3, h2, {dt:5.1f} ms ({desc})")
+    except Exception:
+        continue
+
+tested.sort(key=lambda x: x[0])
+if len(tested) >= 2:
+    sni_xhttp = tested[0][1]
+    sni_grpc = tested[1][1]
+elif len(tested) == 1:
+    sni_xhttp = tested[0][1]
+    sni_grpc = tested[0][1]
+else:
+    sni_xhttp = "swdist.apple.com"
+    sni_grpc = "delivery.mp.microsoft.com"
+
+print(f"\n[OK] Выбраны оптимальные SNI:")
+print(f"    • Для XHTTP: {sni_xhttp}")
+print(f"    • Для gRPC : {sni_grpc}\n")
+
+conn = sqlite3.connect(db_path)
+cur = conn.cursor()
+
+cur.execute("PRAGMA table_info(inbounds);")
+columns = [row[1] for row in cur.fetchall()]
+
+cur.execute("SELECT port FROM inbounds")
+used_db_ports = set(r[0] for r in cur.fetchall())
+
+def is_port_free(port, udp=False):
+    if port in used_db_ports:
+        return False
+    sock_type = socket.SOCK_DGRAM if udp else socket.SOCK_STREAM
+    with socket.socket(socket.AF_INET, sock_type) as s:
+        try:
+            s.bind(("0.0.0.0", port))
+            return True
+        except Exception:
+            return False
+
+def get_free_port(preferred, udp=False):
+    candidate = preferred
+    while not is_port_free(candidate, udp=udp):
+        candidate += 1
+    used_db_ports.add(candidate)
+    return candidate
+
+def insert_inbound(data_dict):
+    valid_keys = [k for k in data_dict.keys() if k in columns]
+    placeholders = ", ".join(["?"] * len(valid_keys))
+    col_names = ", ".join(valid_keys)
+    vals = [data_dict[k] for k in valid_keys]
+    cur.execute(f"INSERT INTO inbounds ({col_names}) VALUES ({placeholders})", vals)
+
+try:
+    sniff_json = json.dumps({
+        "enabled": True,
+        "destOverride": ["http", "tls", "quic"],
+        "metadataOnly": False,
+        "routeOnly": True
+    }, separators=(',', ':'))
+
+    # 1. VLESS Reality XHTTP (Клиент с именем "1")
+    port_vless_xhttp = get_free_port(443)
+    insert_inbound({
+        "user_id": 1, "up": 0, "down": 0, "total": 0,
+        "remark": f"VLESS-Reality-XHTTP-{port_vless_xhttp}",
+        "enable": 1, "port": port_vless_xhttp, "protocol": "vless",
+        "settings": json.dumps({
+            "clients": [{
+                "id": str(uuid.uuid4()), "flow": "", "email": "1",
+                "limitIp": 0, "totalGB": 0, "expiryTime": 0, "enable": True,
+                "tgId": "", "subId": secrets.token_hex(8), "reset": 0
+            }],
+            "decryption": "none", "fallbacks": []
+        }, separators=(',', ':')),
+        "stream_settings": json.dumps({
+            "network": "xhttp", "security": "reality",
+            "realitySettings": {
+                "show": False, "xver": 0, "dest": f"{sni_xhttp}:443",
+                "serverNames": [sni_xhttp],
+                "privateKey": priv_k, "minClient": "", "maxClient": "", "maxTimediff": 0,
+                "shortIds": [secrets.token_hex(8)],
+                "settings": { "publicKey": pub_k, "fingerprint": "chrome", "serverName": "", "spiderX": "/" }
+            },
+            "xhttpSettings": { "path": f"/{secrets.token_hex(4)}", "mode": "auto" }
+        }, separators=(',', ':')),
+        "tag": f"inbound-{port_vless_xhttp}", "sniffing": sniff_json, "listen": "", "expiry_time": 0
+    })
+    print(f"[OK] 1. VLESS-Reality XHTTP : порт {port_vless_xhttp} (SNI: {sni_xhttp}, Клиент: 1)")
+
+    # 2. VLESS Reality gRPC (Клиент с именем "1")
+    port_vless_grpc = get_free_port(2053)
+    insert_inbound({
+        "user_id": 1, "up": 0, "down": 0, "total": 0,
+        "remark": f"VLESS-Reality-gRPC-{port_vless_grpc}",
+        "enable": 1, "port": port_vless_grpc, "protocol": "vless",
+        "settings": json.dumps({
+            "clients": [{
+                "id": str(uuid.uuid4()), "flow": "", "email": "1",
+                "limitIp": 0, "totalGB": 0, "expiryTime": 0, "enable": True,
+                "tgId": "", "subId": secrets.token_hex(8), "reset": 0
+            }],
+            "decryption": "none", "fallbacks": []
+        }, separators=(',', ':')),
+        "stream_settings": json.dumps({
+            "network": "grpc", "security": "reality",
+            "realitySettings": {
+                "show": False, "xver": 0, "dest": f"{sni_grpc}:443",
+                "serverNames": [sni_grpc],
+                "privateKey": priv_k, "minClient": "", "maxClient": "", "maxTimediff": 0,
+                "shortIds": [secrets.token_hex(8)],
+                "settings": { "publicKey": pub_k, "fingerprint": "chrome", "serverName": "", "spiderX": "/" }
+            },
+            "grpcSettings": { "serviceName": f"grpc-{secrets.token_hex(4)}", "multiMode": False }
+        }, separators=(',', ':')),
+        "tag": f"inbound-{port_vless_grpc}", "sniffing": sniff_json, "listen": "", "expiry_time": 0
+    })
+    print(f"[OK] 2. VLESS-Reality gRPC   : порт {port_vless_grpc} (SNI: {sni_grpc}, Клиент: 1)")
+
+    # 3. AmneziaWG Kernel 3.1 Inbound
+    port_wg = get_free_port(51821, udp=True)
+    insert_inbound({
+        "user_id": 1, "up": 0, "down": 0, "total": 0,
+        "remark": f"AmneziaWG-3.1-Inbound-{port_wg}",
+        "enable": 1, "port": port_wg, "protocol": "wireguard",
+        "settings": json.dumps({
+            "secretKey": wg_priv_k,
+            "address": ["10.10.10.1/24"],
+            "peers": [{
+                "publicKey": wg_pub_k,
+                "allowedIPs": ["10.10.10.2/32"]
+            }],
+            "mtu": 1280,
+            "kernelMode": True,
+            "jc": 5, "jmin": 50, "jmax": 1000,
+            "s1": 56, "s2": 112, "s3": 140, "s4": 280,
+            "h1": 128947192, "h2": 827361928, "h3": 472819283, "h4": 918273645,
+            "randomTrailers": True
+        }, separators=(',', ':')),
+        "stream_settings": "{}",
+        "tag": f"inbound-{port_wg}", "sniffing": sniff_json, "listen": "", "expiry_time": 0
+    })
+    print(f"[OK] 3. AmneziaWG Inbound    : порт {port_wg} (UDP, Kernel 3.1, RandomTrailers)")
+
+    conn.commit()
+    print("[OK] База данных успешно обновлена новыми инбаундами и клиентом '1'")
+except Exception as e:
+    print(f"[ОШИБКА] Ошибка при добавлении в БД: {e}")
+    conn.rollback()
+    sys.exit(1)
+finally:
+    conn.close()
+PY
+
+    ok "Типовые подключения готовы"
+}
+
+backup_state() {
+    section "РЕЗЕРВНЫЕ КОПИИ"
+    local stamp
+    stamp="$(date +%Y%m%d-%H%M%S)"
+    [[ -f "$DB" ]] && cp -a "$DB" "$BASE/backup/x-ui.db.$stamp"
+    [[ -f "$XRAY_RUNTIME" ]] && cp -a "$XRAY_RUNTIME" "$BASE/backup/config.json.$stamp"
+    ok "Резервные копии созданы"
+}
+
+# --- XRAY КОНФИГУРАЦИЯ С ИНТЕГРАЦИЕЙ DNS И МАРШРУТИЗАЦИЕЙ СЕРВИСОВ ---
+
+generate_xray_config() {
+    section "НАСТРОЙКА XRAY"
+    local out="$BASE/config-generated.$(date +%Y%m%d-%H%M%S).json"
+
+    python3 - "$XRAY_RUNTIME" "$out" "$WARP_BACKEND" "$PSIPHON_SOCKS" "$USE_PSIPHON" <<'PY'
+import json, sys
+
+src_path, out_path, backend, psock, use_psiphon_str = sys.argv[1:6]
+use_psiphon = (use_psiphon_str == "1")
+
+with open(src_path, "r", encoding="utf-8") as f:
+    cfg = json.load(f)
+
+clean_inbounds = []
+for ib in cfg.get("inbounds", []):
+    tag = ib.get("tag", "")
+    proto = ib.get("protocol", "")
+    if tag == "api" or proto == "dokodemo-door":
+        clean_inbounds.append(ib)
+cfg["inbounds"] = clean_inbounds
+
+# --- Интеграция продвинутого DNS ---
+cfg["dns"] = {
+    "tag": "dns_inbound",
+    "hosts": {},
+    "servers": [
+      {
+        "address": "111.88.96.50",
+        "port": 53,
+        "domains": [
+          "geosite:google",
+          "geosite:google-gemini",
+          "geosite:google-deepmind",
+          "geosite:openai",
+          "geosite:anthropic",
+          "google.com",
+          "googleapis.com",
+          "googlevideo.com",
+          "ggpht.com",
+          "ytimg.com",
+          "youtubei.googleapis.com",
+          "consent.youtube.com"
+        ],
+        "expectedIPs": [],
+        "unexpectedIPs": [],
+        "skipFallback": True,
+        "finalQuery": False,
+        "queryStrategy": "UseIP",
+        "disableCache": False,
+        "timeoutMs": 3000,
+        "serveStale": False,
+        "serveExpiredTTL": 0
+      },
+      {
+        "address": "111.88.96.51",
+        "port": 53,
+        "domains": [
+          "geosite:google",
+          "geosite:google-gemini",
+          "geosite:google-deepmind",
+          "geosite:openai",
+          "geosite:anthropic",
+          "google.com",
+          "googleapis.com",
+          "googlevideo.com",
+          "ggpht.com",
+          "ytimg.com",
+          "youtubei.googleapis.com",
+          "consent.youtube.com"
+        ],
+        "expectedIPs": [],
+        "unexpectedIPs": [],
+        "skipFallback": True,
+        "finalQuery": False,
+        "queryStrategy": "UseIP",
+        "disableCache": False,
+        "timeoutMs": 3000,
+        "serveStale": False,
+        "serveExpiredTTL": 0
+      },
+      {
+        "address": "1.1.1.1",
+        "port": 53,
+        "domains": [],
+        "expectedIPs": [],
+        "unexpectedIPs": [],
+        "skipFallback": False,
+        "finalQuery": False,
+        "queryStrategy": "UseIP",
+        "disableCache": False,
+        "timeoutMs": 3000,
+        "serveStale": False,
+        "serveExpiredTTL": 0
+      },
+      {
+        "address": "8.8.8.8",
+        "port": 53,
+        "domains": [],
+        "expectedIPs": [],
+        "unexpectedIPs": [],
+        "skipFallback": False,
+        "finalQuery": False,
+        "queryStrategy": "UseIP",
+        "disableCache": False,
+        "timeoutMs": 3000,
+        "serveStale": False,
+        "serveExpiredTTL": 0
+      }
+    ],
+    "queryStrategy": "UseIP",
+    "disableCache": False,
+    "disableFallback": False,
+    "disableFallbackIfMatch": False,
+    "enableParallelQuery": True,
+    "useSystemHosts": False,
+    "serveStale": False,
+    "serveExpiredTTL": 0
+}
+
+outbounds = cfg.setdefault("outbounds", [])
+routing = cfg.setdefault("routing", {})
+rules = routing.setdefault("rules", [])
+
+def add_rule(rule):
+    if rule not in rules:
+        rules.append(rule)
+
+outbounds[:] = [
+    x for x in outbounds
+    if isinstance(x, dict) and x.get("tag") not in ("blocked", "psiphon-out", "warp-out", "direct", "dns-out")
+]
+
+# Исходящий для перехвата DNS
+outbounds.append({
+    "tag": "dns-out",
+    "protocol": "dns",
+    "settings": {
+        "rewritePort": 53
+    }
+})
+
+# Прямой выход через IP сервера (без меток WARP)
+outbounds.append({"protocol": "freedom", "tag": "direct", "settings": {}})
+
+# Заблокированный трафик
+outbounds.append({"protocol": "blackhole", "tag": "blocked", "settings": {}})
+
+if use_psiphon:
+    host, port = psock.rsplit(":", 1)
+    outbounds.append({
+        "protocol": "socks",
+        "tag": "psiphon-out",
+        "settings": { "servers": [{"address": host, "port": int(port)}] }
+    })
+
+if backend in ("normal", "awg"):
+    outbounds.append({
+        "protocol": "freedom",
+        "tag": "warp-out",
+        "settings": {},
+        "streamSettings": {
+            "sockopt": {
+                "mark": 255,
+                "domainStrategy": "ForceIPv4"
+            }
+        }
+    })
+
+# --- ПРАВИЛА МАРШРУТИЗАЦИИ ДЛЯ DNS И СЕРВИСОВ ---
+
+# 1. Внутренний DNS трафик из dns_inbound -> direct
+add_rule({
+    "type": "field",
+    "enabled": True,
+    "inboundTag": ["dns_inbound"],
+    "outboundTag": "direct"
+})
+
+# 2. Перехват DNS запросов (порт 53) -> dns-out
+add_rule({
+    "type": "field",
+    "enabled": True,
+    "ip": ["1.1.1.1", "1.0.0.1"],
+    "port": "53",
+    "network": "tcp,udp",
+    "outboundTag": "dns-out"
+})
+
+# 3. Защита от деанонимизации: RU IP адреса в Blackhole
+add_rule({
+    "type": "field",
+    "ip": ["geoip:ru"],
+    "outboundTag": "blocked"
+})
+
+# 4. RU домены и сервисы геолокации в Blackhole
+add_rule({
+    "type": "field",
+    "domain": [
+        "geosite:category-ru", "domain:ru", "domain:su", "domain:xn--p1ai"
+    ],
+    "outboundTag": "blocked"
+})
+
+add_rule({
+    "type": "field",
+    "domain": [
+        "geosite:category-ip-geo-detect"
+    ],
+    "outboundTag": "blocked"
+})
+
+# 5. Российские сервисы и трекеры в Blackhole
+add_rule({
+    "type": "field",
+    "domain": [
+        "domain:x5static.net", "domain:yandex.net", "domain:yastatic.net",
+        "domain:yandex.cloud", "domain:beeline.tv", "domain:mycdn.me",
+        "domain:ozonusercontent.com", "domain:mvk.com", "domain:userapi.com",
+        "domain:vk.cc", "domain:vk.com", "domain:vk.company", "domain:vk.link",
+        "domain:vk.me", "domain:vkcdn.net", "domain:vk-cdn.net", "domain:vk-portal.net",
+        "domain:vk-apps.com", "domain:vk-streaming.com", "domain:vkpay.com",
+        "domain:vkuser.net", "domain:vkuseraudio.com", "domain:vkuseraudio.net",
+        "domain:vkuservideo.com", "domain:vkuservideo.net", "domain:vkuserlive.com",
+        "domain:vkuserlive.net", "domain:vkforms.com", "domain:xn--p1ai", "domain:aliexpress.ru"
+    ],
+    "outboundTag": "blocked"
+})
+
+# 6. Сервисы (Google, YouTube, OpenAI, Anthropic, Gemini) -> Psiphon ИЛИ Напрямую (direct), минуя WARP
+target_services = [
+    "geosite:google",
+    "geosite:google-gemini",
+    "geosite:google-deepmind",
+    "geosite:openai",
+    "geosite:anthropic",
+    "google.com", "www.google.com", "googleapis.com", "googleusercontent.com",
+    "gstatic.com", "googlevideo.com", "youtube.com", "youtu.be",
+    "ggpht.com", "ytimg.com", "youtubei.googleapis.com", "consent.youtube.com"
+]
+target_outbound = "psiphon-out" if use_psiphon else "direct"
+
+add_rule({
+    "type": "field",
+    "domain": target_services,
+    "network": "tcp",
+    "outboundTag": target_outbound
+})
+
+add_rule({
+    "type": "field",
+    "ip": ["geoip:google"],
+    "network": "tcp",
+    "outboundTag": target_outbound
+})
+
+# 7. UDP fallback для этих сервисов -> Blackhole (принудительный HTTP/2)
+add_rule({
+    "type": "field",
+    "domain": target_services,
+    "network": "udp",
+    "outboundTag": "blocked"
+})
+
+add_rule({
+    "type": "field",
+    "ip": ["geoip:google"],
+    "network": "udp",
+    "outboundTag": "blocked"
+})
+
+# 8. Catch-all: весь остальной трафик уходит в WARP
+existing_catchall = any(
+    isinstance(r, dict) and not any(k in r for k in ("ip","domain","port","source","user","inboundTag")) and r.get("outboundTag")
+    for r in rules
+)
+
+if not existing_catchall:
+    add_rule({
+        "type": "field",
+        "network": "tcp,udp",
+        "outboundTag": "warp-out" if backend in ("normal", "awg") else "blocked"
+    })
+
+with open(out_path, "w", encoding="utf-8") as f:
+    json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+print(out_path)
+PY
+
+    XRAY_GENERATED="$out"
+    [[ -s "$XRAY_GENERATED" ]] || die "Xray config не сформирован"
+    ok "Xray config сформирован"
+}
+
+test_xray_config() {
+    section "ПРОВЕРКА XRAY"
+    local log="$BASE/xray-test.log"
+    "$XRAY_BIN" -test -config "$XRAY_GENERATED" 2>&1 | tee "$log"
+    grep -q "Configuration OK" "$log" || die "Xray config не прошёл проверку"
+    ok "Xray: Configuration OK"
+}
+
+persist_xray_safe() {
+    section "СОХРАНЕНИЕ X-RAY (БЕЗОПАСНАЯ ЗАПИСЬ)"
+
+    systemctl stop "$XUI_SERVICE" >/dev/null 2>&1 || true
+
+    [[ -f "$DB" ]] || die "База LucX не найдена"
+
+    sqlite3 "$DB" "DROP TRIGGER IF EXISTS trg_force_sniffing_insert;" 2>/dev/null || true
+
+    python3 - "$DB" "$XRAY_GENERATED" <<'PY'
+import sqlite3, sys
+
+db_p, cfg_p = sys.argv[1:3]
+
+with open(cfg_p, "r", encoding="utf-8") as f:
+    data = f.read()
+
+conn = sqlite3.connect(db_p)
+cur = conn.cursor()
+
+cur.execute("DELETE FROM settings WHERE key='xrayTemplateConfig'")
+cur.execute("INSERT INTO settings (key, value) VALUES ('xrayTemplateConfig', ?)", (data,))
+
+cur.execute("""
+    UPDATE inbounds 
+    SET sniffing = '{"enabled":true,"destOverride":["http","tls","quic"],"metadataOnly":false,"routeOnly":true}'
+    WHERE sniffing IS NULL OR sniffing = '' OR sniffing NOT LIKE '%"enabled":true%'
+""")
+
+conn.commit()
+conn.close()
+PY
+
+    ok "Шаблон Xray безопасно сохранен в БД (чистый TEXT)"
+}
+
+start_lucx() {
+    section "ЗАПУСК LUCX"
+    systemctl reset-failed "$XUI_SERVICE" >/dev/null 2>&1 || true
+    systemctl daemon-reload
+    systemctl start "$XUI_SERVICE" || true
+
+    if xui_wait_active 30; then
+        return 0
+    fi
+    die "x-ui не ACTIVE"
+}
+
+# --- ПОЛУЧЕНИЕ ПАРАМЕТРОВ ДОСТУПА И СБРОС УЧЁТНЫХ ДАННЫХ ---
+
+print_panel_credentials() {
+    section "ВХОД В ПАНЕЛЬ УПРАВЛЕНИЯ LUCX-UI"
+
+    info "Параметры панели (запускается командой x-ui , пункт 11):"
+    echo
+
+    local setting_raw=""
+    if command -v x-ui >/dev/null 2>&1; then
+        setting_raw="$(x-ui settings 2>/dev/null || /usr/local/x-ui/x-ui setting -show 2>/dev/null || true)"
+    elif [[ -x /usr/local/x-ui/x-ui ]]; then
+        setting_raw="$(/usr/local/x-ui/x-ui setting -show 2>/dev/null || true)"
+    fi
+
+    local url_raw=""
+    url_raw="$(grep -iE 'Access URL' <<< "$setting_raw" | head -n1 | sed -E 's/.*[Aa]ccess [Uu][Rr][Ll]:[[:space:]]*//' | xargs)"
+    if [[ -z "$url_raw" ]]; then
+        url_raw="$(grep -iE 'https?://' <<< "$setting_raw" | grep -oE 'https?://[^ ]+' | head -n1)"
+    fi
+
+    # Вывод блока настроек БЕЗ строки с адресом
+    if [[ -n "$setting_raw" ]]; then
+        grep -viE 'Access URL|http://|https://' <<< "$setting_raw" || true
+        echo
+    fi
+
+    echo "------------------------------------------------------------"
+    if [[ -n "$url_raw" ]]; then
+        echo -e "  Адрес (URL) : ${CYAN}${url_raw}${RESET}"
+    else
+        echo -e "  Адрес (URL) : ${CYAN}Не удалось извлечь из x-ui settings${RESET}"
+    fi
+    echo "------------------------------------------------------------"
+    echo "Логин и пароль указаны сразу после успешной установки x-ui (LucX-UI / 3x-ui)."
+    echo "Если вы их не знаете, их можно сбросить:"
+    echo
+    echo "1) Сброс пароля"
+    echo "0) Пропуск"
+    echo
+    local reset_choice=""
+    read -rp "Выберите действие [1/0, Enter=0]: " reset_choice
+    reset_choice="${reset_choice:-0}"
+
+    if [[ "$reset_choice" == "1" ]]; then
+        local cmd="x-ui"
+        if ! command -v x-ui >/dev/null 2>&1 && [[ -x /usr/local/x-ui/x-ui.sh ]]; then
+            cmd="/usr/local/x-ui/x-ui.sh"
+        fi
+
+        local reset_raw=""
+        reset_raw="$(printf "7\ny\n\n\ny\ny\n\n0\n0\n" | $cmd 2>&1 || true)"
+
+        systemctl restart "$XUI_SERVICE" >/dev/null 2>&1 || true
+        local i
+        for ((i=1; i<=15; i++)); do
+            if systemctl is-active --quiet "$XUI_SERVICE"; then
+                break
+            fi
+            sleep 1
+        done
+
+        local clean_user clean_pass
+        clean_user="$(echo "$reset_raw" | sed -E 's/\x1b\[[0-9;]*[a-zA-Z]//g' | grep -i 'username has been reset to:' | sed -E 's/.*reset to:[[:space:]]*//I' | xargs)"
+        clean_pass="$(echo "$reset_raw" | sed -E 's/\x1b\[[0-9;]*[a-zA-Z]//g' | grep -i 'password has been reset to:' | sed -E 's/.*reset to:[[:space:]]*//I' | xargs)"
+
+        echo
+        if [[ -n "$clean_user" && -n "$clean_pass" ]]; then
+            ok "Новые данные для входа:"
+            echo -e "  Логин  : ${GREEN}${clean_user}${RESET}"
+            echo -e "  Пароль : ${GREEN}${clean_pass}${RESET}"
+        else
+            local filtered_output
+            filtered_output="$(echo "$reset_raw" | sed -E 's/\x1b\[[0-9;]*[a-zA-Z]//g' | grep -vE '^[[:space:]]*[╔║╚│─━┌┐└┘├┤┬┴┼]|[0-9]+\.[[:space:]]|Please enter|Management Script' || true)"
+            if [[ -n "$filtered_output" ]]; then
+                echo "$filtered_output"
+            fi
+        fi
+    else
+        ok "Сброс пропущен"
+    fi
+}
+
+# --- ТОЧКА ВХОДА ---
+
+main() {
+    section "WARP + PSIPHON + LUCX"
+    echo "Старт: $(date)"
+
+    cleanup_firewall_rules
+    install_minimal
+    install_lucx
+    install_dependencies
+
+    manage_warp
+    manage_psiphon
+
+    check_psiphon
+    backup_state
+
+    manage_inbounds_xtuna
+
+    generate_xray_config
+    test_xray_config
+    persist_xray_safe
+    start_lucx
+
+    section "ГОТОВО"
+    echo "WARP backend  : $WARP_BACKEND"
+    if [[ "$USE_PSIPHON" == "1" ]]; then
+        echo "Psiphon SOCKS : $PSIPHON_SOCKS"
+        echo "Сервисы (Google, OpenAI, Anthropic) : Psiphon"
+    else
+        echo "Psiphon       : ОТКЛЮЧЕН"
+        echo "Сервисы (Google, OpenAI, Anthropic) : НАПРЯМУЮ (direct, в обход WARP)"
+    fi
+    echo "DNS-модуль    : Интегрирован (upstream/dns-out)"
+    echo "RU-трафик     : BLOCKED / BLACKHOLE"
+    echo "Шаблон Xray   : ПРИМЕНЕН БЕЗОПАСНО"
+    echo "Подключения   : VLESS Reality (XHTTP, gRPC) с клиентом '1' и AmneziaWG Kernel 3.1"
+    echo
+    print_panel_credentials
+    echo
+    ok "Установка и настройка успешно завершены!"
+}
+
+main "$@"
+EOF
+chmod +x /root/warp-psiphon-setup.sh
+/root/warp-psiphon-setup.sh
