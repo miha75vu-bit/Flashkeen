@@ -688,7 +688,7 @@ backup_state() {
     ok "Резервные копии созданы"
 }
 
-# --- XRAY КОНФИГУРАЦИЯ С ИНТЕГРАЦИЕЙ DNS И МАРШРУТИЗАЦИЕЙ СЕРВИСОВ ---
+# --- XRAY КОНФИГУРАЦИЯ С ИНТЕГРАЦИЕЙ МАРШРУТИЗАЦИИ СЕРВИСОВ ---
 
 generate_xray_config() {
     section "НАСТРОЙКА XRAY"
@@ -712,95 +712,9 @@ for ib in cfg.get("inbounds", []):
         clean_inbounds.append(ib)
 cfg["inbounds"] = clean_inbounds
 
-# --- Интеграция продвинутого DNS ---
-cfg["dns"] = {
-    "tag": "dns_inbound",
-    "hosts": {},
-    "servers": [
-      {
-        "address": "111.88.96.50",
-        "port": 53,
-        "domains": [
-          "geosite:google",
-          "geosite:google-gemini",
-          "geosite:google-deepmind",
-          "geosite:openai",
-          "geosite:anthropic",
-          "google.com", "googleapis.com", "googlevideo.com", "ggpht.com",
-          "ytimg.com", "youtubei.googleapis.com", "consent.youtube.com",
-          "youtube.com", "youtu.be"
-        ],
-        "expectedIPs": [],
-        "unexpectedIPs": [],
-        "skipFallback": True,
-        "finalQuery": False,
-        "queryStrategy": "UseIP",
-        "disableCache": False,
-        "timeoutMs": 3000,
-        "serveStale": False,
-        "serveExpiredTTL": 0
-      },
-      {
-        "address": "111.88.96.51",
-        "port": 53,
-        "domains": [
-          "geosite:google",
-          "geosite:google-gemini",
-          "geosite:google-deepmind",
-          "geosite:openai",
-          "geosite:anthropic",
-          "google.com", "googleapis.com", "googlevideo.com", "ggpht.com",
-          "ytimg.com", "youtubei.googleapis.com", "consent.youtube.com",
-          "youtube.com", "youtu.be"
-        ],
-        "expectedIPs": [],
-        "unexpectedIPs": [],
-        "skipFallback": True,
-        "finalQuery": False,
-        "queryStrategy": "UseIP",
-        "disableCache": False,
-        "timeoutMs": 3000,
-        "serveStale": False,
-        "serveExpiredTTL": 0
-      },
-      {
-        "address": "1.1.1.1",
-        "port": 53,
-        "domains": [],
-        "expectedIPs": [],
-        "unexpectedIPs": [],
-        "skipFallback": False,
-        "finalQuery": False,
-        "queryStrategy": "UseIP",
-        "disableCache": False,
-        "timeoutMs": 3000,
-        "serveStale": False,
-        "serveExpiredTTL": 0
-      },
-      {
-        "address": "8.8.8.8",
-        "port": 53,
-        "domains": [],
-        "expectedIPs": [],
-        "unexpectedIPs": [],
-        "skipFallback": False,
-        "finalQuery": False,
-        "queryStrategy": "UseIP",
-        "disableCache": False,
-        "timeoutMs": 3000,
-        "serveStale": False,
-        "serveExpiredTTL": 0
-      }
-    ],
-    "queryStrategy": "UseIP",
-    "disableCache": False,
-    "disableFallback": False,
-    "disableFallbackIfMatch": False,
-    "enableParallelQuery": True,
-    "useSystemHosts": False,
-    "serveStale": False,
-    "serveExpiredTTL": 0
-}
+# Удаляем блок DNS, так как он нам больше не нужен
+if "dns" in cfg:
+    del cfg["dns"]
 
 outbounds = cfg.setdefault("outbounds", [])
 routing = cfg.setdefault("routing", {})
@@ -814,15 +728,6 @@ outbounds[:] = [
     x for x in outbounds
     if isinstance(x, dict) and x.get("tag") not in ("blocked", "psiphon-out", "warp-out", "direct", "dns-out")
 ]
-
-# Исходящий для перехвата DNS
-outbounds.append({
-    "tag": "dns-out",
-    "protocol": "dns",
-    "settings": {
-        "rewritePort": 53
-    }
-})
 
 # Прямой выход через IP сервера (без меток WARP)
 outbounds.append({"protocol": "freedom", "tag": "direct", "settings": {}})
@@ -851,33 +756,16 @@ if backend in ("normal", "awg"):
         }
     })
 
-# --- ПРАВИЛА МАРШРУТИЗАЦИИ ДЛЯ DNS И СЕРВИСОВ ---
+# --- ПРАВИЛА МАРШРУТИЗАЦИИ СЕРВИСОВ ---
 
-# 1. Внутренний DNS трафик из dns_inbound -> direct
-add_rule({
-    "type": "field",
-    "enabled": True,
-    "inboundTag": ["dns_inbound"],
-    "outboundTag": "direct"
-})
-
-# 2. Перехват ВСЕХ DNS запросов (любой IP, порт 53) -> dns-out
-add_rule({
-    "type": "field",
-    "enabled": True,
-    "port": "53",
-    "network": "tcp,udp",
-    "outboundTag": "dns-out"
-})
-
-# 3. Защита от деанонимизации: RU IP адреса в Blackhole
+# 1. Защита от деанонимизации: RU IP адреса в Blackhole
 add_rule({
     "type": "field",
     "ip": ["geoip:ru"],
     "outboundTag": "blocked"
 })
 
-# 4. RU домены и сервисы геолокации в Blackhole
+# 2. RU домены и сервисы геолокации в Blackhole
 add_rule({
     "type": "field",
     "domain": [
@@ -894,7 +782,7 @@ add_rule({
     "outboundTag": "blocked"
 })
 
-# 5. Российские сервисы и трекеры в Blackhole
+# 3. Российские сервисы и трекеры в Blackhole
 add_rule({
     "type": "field",
     "domain": [
@@ -911,7 +799,7 @@ add_rule({
     "outboundTag": "blocked"
 })
 
-# 6. Сервисы (Google, YouTube, OpenAI, Anthropic, Gemini) -> Psiphon ИЛИ Напрямую (direct), минуя WARP
+# 4. Сервисы (Google, YouTube, OpenAI, Anthropic, Gemini) -> Psiphon ИЛИ Напрямую (direct), минуя WARP
 target_services = [
     "geosite:google",
     "geosite:google-gemini",
@@ -938,7 +826,7 @@ add_rule({
     "outboundTag": target_outbound
 })
 
-# 7. UDP fallback для этих сервисов -> Blackhole (принудительный HTTP/2)
+# 5. UDP fallback для этих сервисов -> Blackhole (принудительный HTTP/2)
 add_rule({
     "type": "field",
     "domain": target_services,
@@ -953,7 +841,7 @@ add_rule({
     "outboundTag": "blocked"
 })
 
-# 8. Catch-all: весь остальной трафик уходит в WARP
+# 6. Catch-all: весь остальной трафик уходит в WARP
 existing_catchall = any(
     isinstance(r, dict) and not any(k in r for k in ("ip","domain","port","source","user","inboundTag")) and r.get("outboundTag")
     for r in rules
@@ -1144,7 +1032,7 @@ print_panel_credentials() {
 # --- ТОЧКА ВХОДА ---
 
 main() {
-    section "WARP + PSIPHON + LUCX"
+    section "WARP + PSIPHON + LUCX (БЕЗ DNS ПЕРЕХВАТА)"
     echo "Старт: $(date)"
 
     cleanup_firewall_rules
@@ -1174,7 +1062,7 @@ main() {
         echo "Psiphon       : ОТКЛЮЧЕН"
         echo "Сервисы (Google, OpenAI, Anthropic) : НАПРЯМУЮ (direct, в обход WARP)"
     fi
-    echo "DNS-модуль    : Интегрирован (upstream/dns-out)"
+    echo "DNS-модуль    : ОТКЛЮЧЕН (Используется стандартный клиентский)"
     echo "RU-трафик     : BLOCKED / BLACKHOLE"
     echo "Шаблон Xray   : ПРИМЕНЕН БЕЗОПАСНО"
     echo "Подключения   : Не генерировались скриптом (создайте вручную в панели)"
