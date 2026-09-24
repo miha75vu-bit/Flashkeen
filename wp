@@ -238,3 +238,243 @@ main() {
 }
 
 main "$@"
+#!/usr/bin/env bash
+# Прикрывашка: ищет на VPS LucX и PCA Phobos и запускает нужный скрипт прикрытия.
+set -Eeuo pipefail
+export LANG=C.UTF-8
+export LC_ALL=C.UTF-8
+
+LUX_URL="https://raw.githubusercontent.com/miha75vu-bit/Flashkeen/main/Lux-WP"
+PCA_URL="https://raw.githubusercontent.com/miha75vu-bit/Flashkeen/main/PCA-WP"
+WORKDIR="/root/warp-psiphon-setup"
+INNER=62
+
+if [[ -t 1 ]]; then
+    R=$'\033[0m'
+    B=$'\033[1m'
+    DIM=$'\033[2m'
+    CYAN=$'\033[36m'
+    YELLOW=$'\033[33m'
+    GREEN=$'\033[32m'
+    WHITE=$'\033[97m'
+    RED=$'\033[31m'
+else
+    R= B= DIM= CYAN= YELLOW= GREEN= WHITE= RED=
+fi
+
+if [[ ! -t 0 ]]; then
+    echo "Так меню не откроется. Запустите:"
+    echo "bash <(curl -fsSL https://raw.githubusercontent.com/miha75vu-bit/Flashkeen/main/wp)"
+    exit 1
+fi
+
+die() {
+    printf '%s  %s%s\n' "${RED}" "$*" "${R}" >&2
+    exit 1
+}
+
+has_lux() {
+    [[ -x /usr/local/x-ui/x-ui ]] && return 0
+    systemctl cat x-ui >/dev/null 2>&1
+}
+
+has_phobos() {
+    [[ -f /opt/phobos-panel/app.py ]] && return 0
+    systemctl cat phobos-panel >/dev/null 2>&1
+}
+
+repeat_char() {
+    local ch="$1" n="$2" out=""
+    local i
+    for ((i = 0; i < n; i++)); do
+        out+="$ch"
+    done
+    printf '%s' "$out"
+}
+
+box_top() {
+    printf '%s  ┌%s┐%s\n' "$CYAN" "$(repeat_char "─" "$INNER")" "$R"
+}
+
+box_mid() {
+    printf '%s  ├%s┤%s\n' "$CYAN" "$(repeat_char "─" "$INNER")" "$R"
+}
+
+box_bot() {
+    printf '%s  └%s┘%s\n' "$CYAN" "$(repeat_char "─" "$INNER")" "$R"
+}
+
+box_row() {
+    local text="$1" color="${2:-$WHITE}"
+    local pad=$(( INNER - 2 - ${#text} ))
+    (( pad < 0 )) && pad=0
+    printf '%s  │ %s%s%s%s %s│%s\n' "$CYAN" "$color" "$text" "$R" "$(repeat_char " " "$pad")" "$CYAN" "$R"
+}
+
+box_blank() {
+    box_row "" "$R"
+}
+
+box_wrap() {
+    local color="$1"
+    shift
+    local text="$*" line="" word
+    for word in $text; do
+        if [[ -z "$line" ]]; then
+            line="$word"
+        elif (( ${#line} + 1 + ${#word} > INNER - 2 )); then
+            box_row "$line" "$color"
+            line="$word"
+        else
+            line+=" $word"
+        fi
+    done
+    [[ -n "$line" ]] && box_row "$line" "$color"
+}
+
+explain() {
+    echo
+    box_top
+    box_blank
+    box_row "ПРИКРЫВАШКА" "${B}${WHITE}"
+    box_blank
+    box_wrap "$WHITE" "Прикрываем выход VPN-панели. Трафик клиентов не уходит в интернет напрямую с IP этого сервера."
+    box_blank
+    box_mid
+    box_blank
+    box_row "Зачем" "${B}${CYAN}"
+    box_blank
+    box_wrap "$WHITE" "Без прикрытия сайты видят адрес VPS, а на самом сервере трафик можно разобрать. Бесплатные и российские VPN-приложения часто сами записывают, куда вы ходите, и отдают это своим серверам. Это ещё одна точка слежки, а не защита."
+    box_blank
+    box_row "Как это помогает" "${B}${GREEN}"
+    box_blank
+    box_wrap "$WHITE" "Обычные сайты идут в WARP, не с IP сервера. Российские сайты и шпионские сервисы (Яндекс, VK и похожие) обрываются. Google и Gemini можно пустить через Psiphon. Это отдельный пункт меню, его можно не включать."
+    box_blank
+    box_row "С чего начать" "${B}${YELLOW}"
+    box_blank
+    box_wrap "$WHITE" "Рекомендую попробовать для начала PCA Phobos и только если он не работает — ставить LucX. И использовать не более одного протокола на сервере, так вы уменьшаете вероятность детекта."
+    box_blank
+    box_bot
+    echo
+}
+
+run_cover() {
+    local title="$1" url="$2" file="$3" dest
+    dest="${WORKDIR}/${file}"
+    mkdir -p "$WORKDIR"
+    printf '%s  %s%s\n' "$DIM" "Скачиваем ${title}" "$R"
+    curl -fL --connect-timeout 20 --max-time 180 -o "$dest" "$url" || die "Не удалось скачать ${title}"
+    sed -i 's/\r$//' "$dest"
+    chmod +x "$dest"
+    echo
+    bash "$dest"
+}
+
+ask_no() {
+    local ans
+    read -rp "$(printf '%s  › %s%s' "$CYAN" "$R" "$1") [д/Н, Enter = нет]: " ans || true
+    case "${ans:-Н}" in
+        д|Д|y|Y|yes|Yes|да|Да) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+status_box() {
+    echo
+    box_top
+    box_blank
+    while [[ $# -gt 0 ]]; do
+        if [[ "$1" == "--" ]]; then
+            box_blank
+        else
+            box_row "$1" "$2"
+            shift
+        fi
+        shift
+    done
+    box_blank
+    box_bot
+    echo
+}
+
+main() {
+    local lux=0 phobos=0 first=""
+    explain
+    has_lux && lux=1 || true
+    has_phobos && phobos=1 || true
+
+    if [[ "$lux" == "1" && "$phobos" == "1" ]]; then
+        status_box \
+            "На сервере оба: LucX и PCA Phobos" "${B}${WHITE}" \
+            -- \
+            "Лучше прикрыть один. Второй запустится," "$WHITE" \
+            "только если вы согласитесь." "$WHITE" \
+            -- \
+            "1    Установить и прикрыть PCA Phobos" "${GREEN}" \
+            "2    Установить и прикрыть LucX" "$WHITE"
+        read -rp "$(printf '%s  › %s' "$CYAN" "$R")Кого прикрыть сейчас [1/2, Enter = 1]: " first || true
+        first="${first:-1}"
+        case "$first" in
+            1)
+                echo
+                run_cover "PCA-WP" "$PCA_URL" "PCA-WP" || true
+                echo
+                if ask_no "Всё равно прикрыть ещё LucX?"; then
+                    echo
+                    run_cover "Lux-WP" "$LUX_URL" "Lux-WP"
+                else
+                    printf '%s  %s%s\n' "$DIM" "LucX оставлен без прикрытия." "$R"
+                fi
+                ;;
+            2)
+                echo
+                run_cover "Lux-WP" "$LUX_URL" "Lux-WP" || true
+                echo
+                if ask_no "Всё равно прикрыть ещё PCA Phobos?"; then
+                    echo
+                    run_cover "PCA-WP" "$PCA_URL" "PCA-WP"
+                else
+                    printf '%s  %s%s\n' "$DIM" "PCA Phobos оставлен без прикрытия." "$R"
+                fi
+                ;;
+            *)
+                die "Нет пункта «${first}». Нужно 1 или 2."
+                ;;
+        esac
+        return 0
+    fi
+
+    if [[ "$lux" == "1" ]]; then
+        status_box \
+            "На сервере LucX" "${B}${WHITE}" \
+            "PCA Phobos нет. Прикрываем LucX." "$WHITE"
+        run_cover "Lux-WP" "$LUX_URL" "Lux-WP"
+        return 0
+    fi
+
+    if [[ "$phobos" == "1" ]]; then
+        status_box \
+            "На сервере PCA Phobos" "${B}${WHITE}" \
+            "LucX нет. Прикрываем PCA Phobos." "$WHITE"
+        run_cover "PCA-WP" "$PCA_URL" "PCA-WP"
+        return 0
+    fi
+
+    status_box \
+        "Панель на сервере не найдена" "${B}${WHITE}" \
+        "Скрипт сам поставит выбранную." "$WHITE" \
+        -- \
+        "1    Установить и прикрыть PCA Phobos" "${GREEN}" \
+        "2    Установить и прикрыть LucX" "$WHITE" \
+        "0    Выход" "$DIM"
+    read -rp "$(printf '%s  › %s' "$CYAN" "$R")Выберите [1/2/0, Enter = 1]: " first || true
+    first="${first:-1}"
+    case "$first" in
+        1) echo; run_cover "PCA-WP" "$PCA_URL" "PCA-WP" ;;
+        2) echo; run_cover "Lux-WP" "$LUX_URL" "Lux-WP" ;;
+        0) printf '%s  %s%s\n' "$DIM" "Выход." "$R" ;;
+        *) die "Нет пункта «${first}». Нужно 1, 2 или 0." ;;
+    esac
+}
+
+main "$@"
