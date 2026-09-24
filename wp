@@ -92,11 +92,19 @@ box_wrap() {
     [[ -n "$line" ]] && box_row "$line" "$color"
 }
 
+center_title() {
+    local title="$1"
+    local width=$(( INNER + 4 ))
+    local pad=$(( (width - ${#title}) / 2 ))
+    (( pad < 0 )) && pad=0
+    printf '%s%s%s%s%s\n' "$(repeat_char " " "$pad")" "$B" "$CYAN" "$title" "$R"
+}
+
 explain() {
     echo
+    center_title "Прикрывашка"
+    echo
     box_top
-    box_blank
-    box_row "ПРИКРЫВАШКА" "${B}${WHITE}"
     box_blank
     box_wrap "$WHITE" "Прикрываем выход VPN-панели. Трафик клиентов не уходит в интернет напрямую с IP этого сервера."
     box_blank
@@ -110,9 +118,9 @@ explain() {
     box_blank
     box_wrap "$WHITE" "Обычные сайты идут в WARP, не с IP сервера. Российские сайты и шпионские сервисы (Яндекс, VK и похожие) обрываются. Google и Gemini можно пустить через Psiphon. Это отдельный пункт меню, его можно не включать."
     box_blank
-    box_row "С чего начать" "${B}${YELLOW}"
+    box_row "Рекомендация" "${B}${YELLOW}"
     box_blank
-    box_wrap "$WHITE" "Рекомендую попробовать для начала PCA Phobos и только если он не работает — ставить LucX. И использовать не более одного протокола на сервере, так вы уменьшаете вероятность детекта."
+    box_wrap "$WHITE" "Возьмите PCA Phobos. LucX — только если Phobos не работает. На сервере лучше один протокол: так меньше вероятность детекта."
     box_blank
     box_bot
     echo
