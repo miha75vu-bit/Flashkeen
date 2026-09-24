@@ -1,0 +1,1583 @@
+#!/usr/bin/env bash
+# PCA Phobos: WARP на все выходы, RU в blackhole, Google/Gemini/OpenAI/Anthropic через Psiphon.
+# Клиенты приходят в WireGuard wg0. Наружу их пакеты не форвардятся:
+# PREROUTING TPROXY -> Xray -> psiphon-out | warp-out (fwmark 255) | blackhole.
+set -Eeuo pipefail
+
+export DEBIAN_FRONTEND=noninteractive
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+BASE="/root/warp-psiphon-setup"
+WG_CONF="/etc/wireguard/wg0.conf"
+PANEL_DIR="/opt/phobos-panel"
+PANEL_UNIT="phobos-panel"
+XRAY_BIN="/usr/local/bin/xray"
+XRAY_ASSET="/usr/local/share/xray"
+XRAY_CFG="/usr/local/etc/xray/phobos-exit.json"
+XRAY_UNIT="phobos-xray"
+GUARD="/usr/local/sbin/phobos-exit-guard.sh"
+TPROXY_PORT="61245"
+DNS_FILTER_PORT="5353"
+WARP_TABLE="51820"
+WARP_MARK="255"
+TPROXY_MARK="1"
+VPN_NET_DEFAULT="10.25.0.0/16"
+
+USE_PSIPHON=1
+PSIPHON_PORT="1080"
+PSIPHON_SOCKS="172.17.0.1:1080"
+PSIPHON_REGION="AUTO"
+
+WARP_BACKEND="none"
+WARP_DEV=""
+WARP_OK=0
+ORIG_DEFAULT=""
+WARP_STATE="/etc/phobos-exit-warp.env"
+
+VPS_WARP_INSTALL_URL="https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh"
+PSIPHON_INSTALL_URL="https://raw.githubusercontent.com/Chara-Freedom/vps-psiphon/main/psiphon_install.sh"
+PHOBOS_INSTALL_URL="https://raw.githubusercontent.com/andrey271192/PCA_Phobos/main/install.sh"
+XRAY_INSTALL_URL="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
+GEO_BASE="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download"
+
+mkdir -p "$BASE" "$BASE/backup"
+chmod 700 "$BASE"
+
+LOG="$BASE/setup.log"
+exec > >(tee -a "$LOG") 2>&1
+
+GREEN="\033[1;32m"
+YELLOW="\033[1;33m"
+RED="\033[1;31m"
+CYAN="\033[1;36m"
+RESET="\033[0m"
+
+ok()   { echo -e "${GREEN}[OK]${RESET} $*"; }
+warn() { echo -e "${YELLOW}[WARN]${RESET} $*"; }
+die()  { echo -e "${RED}[ОШИБКА]${RESET} $*"; exit 1; }
+info() { echo -e "${CYAN}$*${RESET}"; }
+
+section() {
+    echo
+    echo "============================================================"
+    echo "$*"
+    echo "============================================================"
+    echo
+}
+
+public_iface() {
+    ip -4 route show default 2>/dev/null | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit }}'
+}
+
+vpn_net() {
+    local cidr
+    cidr="$(awk -F= 'BEGIN{IGNORECASE=1} /^[[:space:]]*Address/{gsub(/[[:space:]]/,"",$2); split($2,a,","); print a[1]; exit}' "$WG_CONF" 2>/dev/null || true)"
+    if [[ -z "$cidr" ]]; then
+        echo "$VPN_NET_DEFAULT"
+        return 0
+    fi
+    python3 - "$cidr" <<'PY' || echo "$VPN_NET_DEFAULT"
+import sys, ipaddress
+print(ipaddress.ip_interface(sys.argv[1].strip()).network)
+PY
+}
+
+drop_open_nat() {
+    local net="$1"
+    local rule
+    while read -r rule; do
+        [[ "$rule" == "-A POSTROUTING "* ]] || continue
+        [[ "$rule" == *" -j MASQUERADE"* || "$rule" == *" -j SNAT"* ]] || continue
+        if [[ "$rule" != *" -s "* && "$rule" != *" -d "* && "$rule" == *" -j MASQUERADE"* ]]; then
+            iptables -t nat ${rule/-A /-D }
+            continue
+        fi
+        if [[ "$rule" == *" -s ${net} "* ]]; then
+            iptables -t nat ${rule/-A /-D }
+        fi
+    done < <(iptables -t nat -S POSTROUTING 2>/dev/null || true)
+}
+
+# Закрыть прямой форвард клиентов сразу, ещё до WARP/Xray.
+lock_client_egress() {
+    local net
+    ip link show wg0 >/dev/null 2>&1 || return 0
+    net="$(vpn_net)"
+    iptables -N PHOBOS_FWD 2>/dev/null || true
+    iptables -F PHOBOS_FWD
+    iptables -A PHOBOS_FWD -d "$net" -j ACCEPT
+    iptables -A PHOBOS_FWD -j REJECT
+    while iptables -D FORWARD -i wg0 -j PHOBOS_FWD 2>/dev/null; do :; done
+    iptables -I FORWARD 1 -i wg0 -j PHOBOS_FWD
+    while iptables -D FORWARD -i wg0 -j ACCEPT 2>/dev/null; do :; done
+    while iptables -D FORWARD -o wg0 -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null; do :; done
+    drop_open_nat "$net"
+    if ! command -v conntrack >/dev/null 2>&1; then
+        apt-get install -y conntrack >/dev/null 2>&1 || true
+    fi
+    if command -v conntrack >/dev/null 2>&1; then
+        conntrack -D -s "$net" >/dev/null 2>&1 || true
+    fi
+    if command -v ip6tables >/dev/null 2>&1; then
+        ip6tables -N PHOBOS_FWD6 2>/dev/null || true
+        ip6tables -F PHOBOS_FWD6
+        ip6tables -A PHOBOS_FWD6 -j REJECT --reject-with icmp6-addr-unreachable
+        while ip6tables -D FORWARD -i wg0 -j PHOBOS_FWD6 2>/dev/null; do :; done
+        ip6tables -I FORWARD 1 -i wg0 -j PHOBOS_FWD6
+    fi
+    ok "Прямой выход wg0 закрыт (разрешён только ${net})"
+}
+
+# Уже выданные конфиги телефонов и роутеров часто содержат только 0.0.0.0/0.
+# Тогда IPv6 Google идёт напрямую у провайдера и страница пишет «не поддерживается в вашей стране».
+pin_client_full_tunnel() {
+    python3 <<'PY'
+import re
+from pathlib import Path
+
+changed = []
+roots = [Path("/opt/Phobos"), Path("/opt/phobos-panel")]
+seen = set()
+files = []
+for root in roots:
+    if not root.is_dir():
+        continue
+    for conf in root.rglob("*"):
+        if not conf.is_file() or conf in seen:
+            continue
+        if conf.suffix.lower() not in {".conf", ".txt", ".template"} and conf.name != "app.py":
+            continue
+        seen.add(conf)
+        files.append(conf)
+
+v6_block = re.compile(
+    r'(?P<ind>[ \t]*)if "0\.0\.0\.0/0" not in parts:\n'
+    r'(?P=ind)(?P<pad>[ \t]+)parts\.insert\(0, "0\.0\.0\.0/0"\)'
+)
+
+for conf in files:
+    try:
+        text = conf.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        continue
+    if "AllowedIPs" not in text and conf.name != "app.py":
+        continue
+    orig = text
+    if conf.name == "app.py":
+        if 'if "::/0" not in parts:' not in text:
+            def _add_v6(match):
+                ind = match.group("ind")
+                pad = match.group("pad")
+                return (
+                    match.group(0)
+                    + "\n"
+                    + f'{ind}if "::/0" not in parts:\n'
+                    + f'{ind}{pad}parts.append("::/0")'
+                )
+            text, _ = v6_block.subn(_add_v6, text, count=1)
+    else:
+        lines = []
+        for ln in text.splitlines(keepends=True):
+            stripped = ln.strip()
+            if stripped.lower().startswith("allowedips") and "=" in stripped:
+                nl = "\n" if ln.endswith("\n") else ""
+                key, _, val = stripped.partition("=")
+                parts = [p.strip() for p in val.split(",") if p.strip()]
+                if "0.0.0.0/0" not in parts:
+                    parts.insert(0, "0.0.0.0/0")
+                if "::/0" not in parts:
+                    parts.append("::/0")
+                ln = f"{key.strip()} = {', '.join(parts)}{nl}"
+            lines.append(ln)
+        text = "".join(lines)
+    if text != orig:
+        if conf.name == "app.py":
+            try:
+                compile(text, str(conf), "exec")
+            except SyntaxError:
+                continue
+        conf.write_text(text, encoding="utf-8", newline="\n")
+        changed.append(str(conf))
+print(len(changed))
+PY
+}
+
+remember_default_route() {
+    ORIG_DEFAULT="$(ip -4 route show default 2>/dev/null | head -n1 || true)"
+}
+
+restore_public_default() {
+    local dev
+    dev="$(public_iface || true)"
+    if [[ -n "$dev" && "$dev" != "warp" ]]; then
+        return 0
+    fi
+    [[ -n "$ORIG_DEFAULT" ]] || die "Пропал публичный default route"
+    ip route replace $ORIG_DEFAULT
+    dev="$(public_iface || true)"
+    [[ -n "$dev" && "$dev" != "warp" ]] || die "Публичный default route не восстановлен"
+    ok "Основной default оставлен на ${dev}"
+}
+
+drop_unmarked_warp_rules() {
+    local pri rest
+    while read -r pri rest; do
+        [[ -n "$pri" ]] || continue
+        pri="${pri%:}"
+        if [[ "$rest" == *"lookup ${WARP_TABLE}"* && "$rest" != *"fwmark"* ]]; then
+            ip rule del priority "$pri" 2>/dev/null || true
+            warn "Удалено правило, которое гнало весь трафик сервера в WARP (priority ${pri})"
+        fi
+    done < <(ip rule show 2>/dev/null || true)
+}
+
+has_warp_fwmark_rule() {
+    local rules
+    rules="$(ip rule show 2>/dev/null || true)"
+    # iproute2 обычно печатает "fwmark 0xff lookup 51820"
+    grep -Eq "fwmark (0xff|0xFF|255)(/[^ ]*)? (lookup|table) ${WARP_TABLE}" <<<"$rules"
+}
+
+purge_warp_fwmark_rules() {
+    local i
+    for ((i = 0; i < 12; i++)); do
+        ip rule del fwmark "$WARP_MARK" lookup "$WARP_TABLE" 2>/dev/null || true
+        ip rule del fwmark "$WARP_MARK" table "$WARP_TABLE" 2>/dev/null || true
+        ip rule del fwmark 0xff lookup "$WARP_TABLE" 2>/dev/null || true
+        ip rule del fwmark 0xff table "$WARP_TABLE" 2>/dev/null || true
+        has_warp_fwmark_rule || return 0
+    done
+}
+
+save_warp_state() {
+    umask 077
+    cat > "$WARP_STATE" <<EOF
+WARP_BACKEND=${WARP_BACKEND}
+WARP_DEV=${WARP_DEV}
+WARP_OK=${WARP_OK}
+WARP_TABLE=${WARP_TABLE}
+WARP_MARK=${WARP_MARK}
+EOF
+}
+
+# --- WARP ---
+
+get_active_normal_warp() {
+    local trace
+    ip link show warp >/dev/null 2>&1 || return 1
+    trace="$(curl -4fsS --interface warp --max-time 6 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)"
+    grep -q 'warp=' <<<"$trace" || return 1
+    echo "warp"
+}
+
+
+heal_policy_routing() {
+    local dev="$1"
+    [[ -n "$dev" ]] || die "heal_policy_routing: пустой интерфейс WARP"
+    ip link show "$dev" >/dev/null 2>&1 || die "Интерфейс WARP ${dev} не найден"
+    # fwmark 255 -> table 51820; чужой PostDown мог снять правило — восстанавливаем.
+    purge_warp_fwmark_rules
+    ip route replace default dev "$dev" table "$WARP_TABLE"
+    ip rule add fwmark "$WARP_MARK" lookup "$WARP_TABLE" priority 100
+    drop_unmarked_warp_rules
+    restore_public_default
+    has_warp_fwmark_rule || die "Не удалось создать ip rule fwmark ${WARP_MARK} -> table ${WARP_TABLE}"
+    ip route show table "$WARP_TABLE" | grep -q "^default" || die "В таблице ${WARP_TABLE} нет default через ${dev}"
+    WARP_DEV="$dev"
+    save_warp_state
+    ok "Маршрутизация (fwmark ${WARP_MARK} -> table ${WARP_TABLE} -> ${dev}) активна, default сервера не тронут"
+}
+
+cleanup_firewall_rules() {
+    iptables -D OUTPUT -m mark ! --mark 255 -p tcp -j REJECT >/dev/null 2>&1 || true
+    iptables -D OUTPUT -m mark ! --mark 255 -p udp -j REJECT >/dev/null 2>&1 || true
+}
+
+cleanup_normal_warp() {
+    section "ОЧИСТКА ОБЫЧНОГО WARP"
+    if command -v vps-warp >/dev/null 2>&1; then
+        vps-warp off >/dev/null 2>&1 || true
+    fi
+    systemctl stop wg-quick@warp >/dev/null 2>&1 || true
+    systemctl disable wg-quick@warp >/dev/null 2>&1 || true
+    ip link del warp >/dev/null 2>&1 || true
+    ip route del default dev warp table "$WARP_TABLE" >/dev/null 2>&1 || true
+    ok "Обычный WARP отключен"
+}
+
+purge_legacy_awg_warp() {
+    # Старые установки резервного AWG больше не поддерживаются — убираем остатки.
+    local srv awg_links iface
+    for srv in $(systemctl list-unit-files 'awg-quick@*' --no-legend 2>/dev/null | awk '{print $1}' || true); do
+        systemctl disable --now "$srv" >/dev/null 2>&1 || true
+    done
+    awg_links="$(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | grep -E '^awgo-' || true)"
+    for iface in $awg_links; do
+        awg-quick down "$iface" >/dev/null 2>&1 || true
+        ip link del "$iface" >/dev/null 2>&1 || true
+        ip route del default dev "$iface" table "$WARP_TABLE" >/dev/null 2>&1 || true
+    done
+    rm -f /etc/amnezia/amneziawg/awgo-*.conf 2>/dev/null || true
+}
+
+install_minimal() {
+    section "1/7 ПОДГОТОВКА СИСТЕМЫ"
+    apt-get update -y >/dev/null 2>&1
+    apt-get install -y curl ca-certificates >/dev/null 2>&1
+    ok "Базовые пакеты проверены"
+}
+
+install_phobos() {
+    section "УСТАНОВКА PCA PHOBOS"
+    if [[ -f "$PANEL_DIR/app.py" && -f "$WG_CONF" ]] && systemctl cat "$PANEL_UNIT" >/dev/null 2>&1; then
+        ok "PCA Phobos уже установлен — пропускаем"
+        return 0
+    fi
+    info "Ставим PCA Phobos (WireGuard + панель)..."
+    local installer="$BASE/phobos-install.sh"
+    curl -fL --connect-timeout 20 --max-time 180 "$PHOBOS_INSTALL_URL" -o "$installer" || die "Не удалось скачать установщик PCA Phobos"
+    bash "$installer" || die "Установщик PCA Phobos завершился с ошибкой"
+    [[ -f "$PANEL_DIR/app.py" && -f "$WG_CONF" ]] || die "PCA Phobos не установлен"
+    ok "PCA Phobos установлен"
+}
+
+install_dependencies() {
+    section "ЗАВИСИМОСТИ"
+    apt-get update -y >/dev/null 2>&1
+    apt-get install -y \
+        jq sqlite3 iproute2 iptables \
+        wireguard-tools unzip xz-utils socat procps \
+        net-tools curl ca-certificates python3 coreutils openssl psmisc conntrack \
+        gpg >/dev/null 2>&1
+
+    if ! command -v docker >/dev/null 2>&1; then
+        curl -fsSL https://get.docker.com | sh
+    fi
+    systemctl enable --now docker >/dev/null 2>&1 || true
+    ok "Зависимости готовы"
+}
+
+install_normal_warp() {
+    section "УСТАНОВКА ОБЫЧНОГО WARP"
+    if get_active_normal_warp >/dev/null; then
+        ok "Существующий WARP уже работает — переустановка не нужна"
+        vps-warp status 2>/dev/null || true
+        heal_policy_routing "warp"
+        return 0
+    fi
+
+    info "Скачиваем и запускаем установщик vps-warp..."
+    local installer="$BASE/warp_install.sh"
+    if ! curl -fL --connect-timeout 10 --max-time 30 "$VPS_WARP_INSTALL_URL" -o "$installer"; then
+        warn "Не удалось скачать установщик vps-warp"
+        return 1
+    fi
+    chmod +x "$installer"
+    if ! bash "$installer"; then
+        warn "Установщик vps-warp завершился с ошибкой"
+        restore_public_default || true
+        return 1
+    fi
+
+    local i
+    for ((i = 1; i <= 20; i++)); do
+        echo "    WARP: $i/20 сек..."
+        if get_active_normal_warp >/dev/null; then
+            ok "Обычный WARP подключен"
+            heal_policy_routing "warp"
+            vps-warp status 2>/dev/null || true
+            return 0
+        fi
+        sleep 1
+    done
+    restore_public_default || true
+    return 1
+}
+
+
+manage_warp() {
+    section "УПРАВЛЕНИЕ И ВЫБОР РЕЖИМА WARP"
+    local active_normal="" choice=""
+    purge_legacy_awg_warp
+    active_normal="$(get_active_normal_warp || true)"
+
+    echo "Текущий статус туннеля WARP на сервере:"
+    if [[ -n "$active_normal" ]]; then
+        ok "Обнаружен активный [Обычный WARP] (интерфейс: $active_normal)"
+    else
+        warn "Активный рабочий туннель WARP не найден"
+    fi
+    echo
+
+    if [[ -n "$active_normal" ]]; then
+        echo "0) Оставить текущий рабочий WARP (восстановит маршруты без переустановки)"
+        echo "1) Переустановить Обычный WARP (vps-warp)"
+        echo "2) Отключить WARP (весь прочий трафик будет заблокирован)"
+        echo
+        read -rp "Выберите действие [0/1/2, Enter=0]: " choice
+        choice="${choice:-0}"
+    else
+        echo "1) Установить Обычный WARP (vps-warp)"
+        echo "0) Пропустить настройку WARP (без WARP весь прочий трафик будет заблокирован)"
+        echo
+        read -rp "Выберите действие [1/0, Enter=1]: " choice
+        choice="${choice:-1}"
+    fi
+
+    case "$choice" in
+        0)
+            if [[ -n "$active_normal" ]]; then
+                ok "Сохраняем текущий Обычный WARP ($active_normal)"
+                WARP_BACKEND="normal"
+                WARP_OK=1
+                heal_policy_routing "$active_normal"
+            else
+                info "Работа продолжится без WARP: весь трафик кроме Psiphon/direct будет заблокирован"
+                WARP_BACKEND="none"
+                WARP_DEV=""
+                WARP_OK=0
+                save_warp_state
+            fi
+            ;;
+        1)
+            if install_normal_warp; then
+                WARP_BACKEND="normal"
+                WARP_OK=1
+                heal_policy_routing "warp"
+            else
+                die "Не удалось запустить Обычный WARP"
+            fi
+            ;;
+        2)
+            if [[ -z "$active_normal" ]]; then
+                die "Неизвестный пункт. Выход без открытия прямого канала."
+            fi
+            cleanup_normal_warp
+            WARP_BACKEND="none"
+            WARP_DEV=""
+            WARP_OK=0
+            save_warp_state
+            ok "WARP отключен"
+            ;;
+        *)
+            die "Неизвестный пункт. Выход без открытия прямого канала."
+            ;;
+    esac
+    restore_public_default
+    if [[ "$WARP_OK" == "1" ]]; then
+        [[ -n "$WARP_DEV" ]] || WARP_DEV="$(get_active_normal_warp || true)"
+        heal_policy_routing "$WARP_DEV"
+    fi
+}
+
+# --- PSIPHON ---
+
+psiphon_local_listener() {
+    ss -lntp 2>/dev/null | awk -v port=":$PSIPHON_PORT" 'NR > 1 && $1 == "LISTEN" && index($4, port) > 0 { print $4; exit }'
+}
+
+psiphon_local_addr() {
+    awk '{ x=$0; sub(/:[0-9]+$/, "", x); gsub(/^\[|\]$/, "", x); print x }' <<<"$1"
+}
+
+refresh_psiphon_socks() {
+    local gw
+    gw="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.Gateway}}{{end}}' vps-psiphon 2>/dev/null || true)"
+    if [[ "$gw" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        PSIPHON_SOCKS="${gw}:${PSIPHON_PORT}"
+    fi
+}
+
+get_active_psiphon_trace() {
+    local listener addr trace
+    listener="$(psiphon_local_listener)"
+    [[ -n "$listener" ]] || return 1
+    addr="$(psiphon_local_addr "$listener")"
+    case "$addr" in
+        0.0.0.0|::|"") return 1 ;;
+    esac
+    refresh_psiphon_socks
+    trace="$(timeout 10 curl -4fsS --proxy "socks5h://${PSIPHON_SOCKS}" --max-time 8 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)"
+    if grep -q 'ip=' <<<"$trace"; then
+        echo "$trace"
+        return 0
+    fi
+    return 1
+}
+
+choose_psiphon_region() {
+    echo "Выберите регион выхода Psiphon:"
+    echo "  AUTO — автоматически (рекомендуется)"
+    echo "  DE  NL  FI  SE  FR  GB  US  CA"
+    echo
+    read -rp "Регион [AUTO]: " PSIPHON_REGION
+    PSIPHON_REGION="${PSIPHON_REGION:-AUTO}"
+    PSIPHON_REGION="$(echo "$PSIPHON_REGION" | tr -d ' ')"
+}
+
+install_psiphon_core() {
+    choose_psiphon_region
+    echo "Устанавливаем / перезапускаем Psiphon..."
+    local psiphon_args=("--socks-port" "$PSIPHON_PORT" "--no-http")
+    if [[ "${PSIPHON_REGION^^}" != "AUTO" ]]; then
+        psiphon_args+=("--region" "${PSIPHON_REGION^^}")
+    fi
+    docker rm -f vps-psiphon >/dev/null 2>&1 || true
+    if ! timeout 150 bash <(curl -fsSL "$PSIPHON_INSTALL_URL") "${psiphon_args[@]}"; then
+        warn "Установка Psiphon завершилась ошибкой"
+        return 1
+    fi
+    refresh_psiphon_socks
+    local i
+    for ((i = 1; i <= 25; i++)); do
+        echo "    Psiphon: $i/25 сек..."
+        if get_active_psiphon_trace >/dev/null; then
+            ok "Psiphon HTTPS работает (${PSIPHON_SOCKS})"
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+disable_psiphon() {
+    # Полностью гасим контейнер, а не только отвязываем от Xray/Phobos.
+    local unit c
+    for unit in $(systemctl list-unit-files '*psiphon*' --no-legend 2>/dev/null | awk '{print $1}' || true); do
+        systemctl disable --now "$unit" >/dev/null 2>&1 || true
+    done
+    if command -v docker >/dev/null 2>&1; then
+        docker update --restart=no vps-psiphon >/dev/null 2>&1 || true
+        docker rm -f vps-psiphon >/dev/null 2>&1 || true
+        while read -r c; do
+            [[ -n "$c" ]] || continue
+            docker update --restart=no "$c" >/dev/null 2>&1 || true
+            docker rm -f "$c" >/dev/null 2>&1 || true
+        done < <(docker ps -aq --filter "name=psiphon" 2>/dev/null || true)
+    fi
+    USE_PSIPHON=0
+    if command -v docker >/dev/null 2>&1 && docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qiE '(^|-)psiphon($|-)'; then
+        warn "После отключения всё ещё видны docker-контейнеры Psiphon"
+        return 1
+    fi
+    if ss -lntp 2>/dev/null | grep -qE ':(1080)\b'; then
+        warn "Порт 1080 всё ещё слушает кто-то после отключения Psiphon"
+        return 1
+    fi
+    return 0
+}
+
+manage_psiphon() {
+    section "УПРАВЛЕНИЕ И ВЫБОР РЕЖИМА PSIPHON"
+    local trace="" choice=""
+    refresh_psiphon_socks
+    trace="$(get_active_psiphon_trace || true)"
+
+    if [[ -n "$trace" ]]; then
+        local ip loc
+        ip="$(awk -F= '$1=="ip"{print $2}' <<<"$trace" | head -n1)"
+        loc="$(awk -F= '$1=="loc"{print $2}' <<<"$trace" | head -n1)"
+        ok "Обнаружен активный рабочий Psiphon"
+        echo "    SOCKS: $PSIPHON_SOCKS"
+        echo "    Exit IP: ${ip:-unknown}"
+        echo "    Country: ${loc:-unknown}"
+        echo
+        echo "Psiphon — режим для работы Gemini. Пока нормально не работает, можете протестировать."
+        echo "Если Gemini не откроется, запустите скрипт ещё раз и выберите «Не использовать Psiphon»."
+        echo
+        echo "0) Оставить текущий рабочий Psiphon (пропустить переустановку)"
+        echo "1) Переустановить / сменить регион Psiphon"
+        echo "2) Не использовать Psiphon (Google/Gemini/OpenAI/Anthropic пойдут напрямую с IP сервера, мимо WARP)"
+        echo
+        read -rp "Выберите действие [0/1/2, Enter=0]: " choice
+        choice="${choice:-0}"
+        case "$choice" in
+            0)
+                ok "Сохраняем текущий рабочий Psiphon"
+                USE_PSIPHON=1
+                return 0
+                ;;
+            1)
+                install_psiphon_core || die "Psiphon не удалось запустить"
+                USE_PSIPHON=1
+                return 0
+                ;;
+            2)
+                info "Не используем Psiphon..."
+                disable_psiphon || warn "Psiphon мог остаться в фоне — проверьте: docker ps | grep -i psiphon"
+                ok "Psiphon выключен и контейнер удалён. Google/Gemini/OpenAI/Anthropic пойдут напрямую (direct), остальное — в WARP или в блок"
+                return 0
+                ;;
+            *)
+                die "Неизвестный выбор Psiphon. Выход без изменения политики."
+                ;;
+        esac
+    fi
+
+    warn "Активный рабочий Psiphon не обнаружен"
+    echo
+    echo "Psiphon — режим для работы Gemini. Пока нормально не работает, можете протестировать."
+    echo "Если Gemini не откроется, запустите скрипт ещё раз и выберите «Не использовать Psiphon»."
+    echo
+    echo "1) Установить Psiphon"
+    echo "0) Не использовать Psiphon (Google/Gemini/OpenAI/Anthropic пойдут напрямую с IP сервера)"
+    echo
+    read -rp "Выберите действие [1/0, Enter=1]: " choice
+    choice="${choice:-1}"
+    if [[ "$choice" == "0" ]]; then
+        info "Не используем Psiphon..."
+        disable_psiphon || warn "Psiphon мог остаться в фоне — проверьте: docker ps | grep -i psiphon"
+        ok "Psiphon выключен и контейнер удалён. Google/Gemini/OpenAI/Anthropic пойдут напрямую (direct), остальное — в WARP или в блок"
+        return 0
+    fi
+    [[ "$choice" == "1" ]] || die "Неизвестный выбор Psiphon."
+    install_psiphon_core || die "Psiphon не удалось запустить"
+    USE_PSIPHON=1
+}
+
+check_psiphon() {
+    if [[ "${USE_PSIPHON:-1}" == "0" ]]; then
+        info "Psiphon отключен пользователем — проверка SOCKS пропущена"
+        return 0
+    fi
+    section "ПРОВЕРКА SOCKS PSIPHON"
+    refresh_psiphon_socks
+    local test ip loc
+    test="$(timeout 15 curl -4fsS --proxy "socks5h://${PSIPHON_SOCKS}" --max-time 12 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)"
+    [[ -n "$test" ]] || die "Psiphon SOCKS не передаёт HTTPS (${PSIPHON_SOCKS})"
+    ip="$(awk -F= '$1=="ip"{print $2}' <<<"$test" | head -n1)"
+    loc="$(awk -F= '$1=="loc"{print $2}' <<<"$test" | head -n1)"
+    ok "Psiphon передаёт HTTPS"
+    echo "    SOCKS: $PSIPHON_SOCKS"
+    echo "    Exit IP: ${ip:-unknown}"
+    echo "    Country: ${loc:-unknown}"
+}
+
+# --- XRAY + GUARD ---
+
+install_xray() {
+    section "УСТАНОВКА XRAY"
+    if [[ ! -x "$XRAY_BIN" ]]; then
+        bash -c "$(curl -fsSL "$XRAY_INSTALL_URL")" @ install || die "Установщик Xray завершился с ошибкой"
+    fi
+    [[ -x "$XRAY_BIN" ]] || die "Xray не установлен"
+    systemctl disable --now xray >/dev/null 2>&1 || true
+    mkdir -p "$XRAY_ASSET" /usr/local/etc/xray
+    local name
+    for name in geoip.dat geosite.dat; do
+        curl -fL --retry 3 --retry-delay 2 --connect-timeout 20 --max-time 180 \
+            -o "${XRAY_ASSET}/${name}.tmp" "${GEO_BASE}/${name}" \
+            || die "Не удалось скачать ${name}"
+        mv "${XRAY_ASSET}/${name}.tmp" "${XRAY_ASSET}/${name}"
+    done
+    # Те же RU-пакеты, что у LucX: ext:geoip_RU.dat / ext:geosite_RU.dat
+    curl -fL --retry 3 --retry-delay 2 --connect-timeout 20 --max-time 180 \
+        -o "${XRAY_ASSET}/geoip_RU.dat.tmp" \
+        "https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geoip.dat" \
+        && mv "${XRAY_ASSET}/geoip_RU.dat.tmp" "${XRAY_ASSET}/geoip_RU.dat" \
+        || warn "geoip_RU.dat не скачан, останется geoip:ru"
+    curl -fL --retry 3 --retry-delay 2 --connect-timeout 20 --max-time 180 \
+        -o "${XRAY_ASSET}/geosite_RU.dat.tmp" \
+        "https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geosite.dat" \
+        && mv "${XRAY_ASSET}/geosite_RU.dat.tmp" "${XRAY_ASSET}/geosite_RU.dat" \
+        || warn "geosite_RU.dat не скачан, останется geosite:category-ru"
+    ok "Xray и geoip/geosite готовы"
+}
+
+write_guard() {
+    cat > "$GUARD" <<'GUARD'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+WG_CONF="/etc/wireguard/wg0.conf"
+TPROXY_PORT="61245"
+TPROXY_MARK="1"
+VPN_NET_DEFAULT="10.25.0.0/16"
+WARP_STATE="/etc/phobos-exit-warp.env"
+WARP_TABLE="51820"
+WARP_MARK="255"
+
+vpn_net() {
+    local cidr
+    cidr="$(awk -F= 'BEGIN{IGNORECASE=1} /^[[:space:]]*Address/{gsub(/[[:space:]]/,"",$2); split($2,a,","); print a[1]; exit}' "$WG_CONF" 2>/dev/null || true)"
+    if [[ -z "$cidr" ]]; then
+        echo "$VPN_NET_DEFAULT"
+        return 0
+    fi
+    python3 - "$cidr" <<'PY' || echo "$VPN_NET_DEFAULT"
+import sys, ipaddress
+print(ipaddress.ip_interface(sys.argv[1].strip()).network)
+PY
+}
+
+public_iface() {
+    ip -4 route show default 2>/dev/null | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit }}'
+}
+
+has_warp_fwmark_rule() {
+    local rules
+    rules="$(ip rule show 2>/dev/null || true)"
+    grep -Eq "fwmark (0xff|0xFF|255)(/[^ ]*)? (lookup|table) ${WARP_TABLE}" <<<"$rules"
+}
+
+heal_warp_from_state() {
+    [[ -f "$WARP_STATE" ]] || return 0
+    # shellcheck disable=SC1090
+    . "$WARP_STATE"
+    [[ "${WARP_OK:-0}" == "1" ]] || return 0
+    local dev="${WARP_DEV:-}"
+    [[ -n "$dev" ]] || return 0
+    ip link show "$dev" >/dev/null 2>&1 || return 0
+    local i
+    for ((i = 0; i < 8; i++)); do
+        ip rule del fwmark "$WARP_MARK" lookup "$WARP_TABLE" 2>/dev/null || true
+        ip rule del fwmark "$WARP_MARK" table "$WARP_TABLE" 2>/dev/null || true
+        has_warp_fwmark_rule || break
+    done
+    ip route replace default dev "$dev" table "$WARP_TABLE"
+    ip rule add fwmark "$WARP_MARK" lookup "$WARP_TABLE" priority 100
+    has_warp_fwmark_rule
+}
+
+drop_open_nat() {
+    local net="$1" rule
+    while read -r rule; do
+        [[ "$rule" == "-A POSTROUTING "* ]] || continue
+        [[ "$rule" == *" -j MASQUERADE"* || "$rule" == *" -j SNAT"* ]] || continue
+        if [[ "$rule" != *" -s "* && "$rule" != *" -d "* && "$rule" == *" -j MASQUERADE"* ]]; then
+            iptables -t nat ${rule/-A /-D }
+            continue
+        fi
+        if [[ "$rule" == *" -s ${net} "* ]]; then
+            iptables -t nat ${rule/-A /-D }
+        fi
+    done < <(iptables -t nat -S POSTROUTING 2>/dev/null || true)
+}
+
+apply_sysctl() {
+    sysctl -qw net.ipv4.ip_forward=1
+    sysctl -qw net.ipv4.conf.all.accept_source_route=0 || true
+    sysctl -qw net.ipv4.conf.default.accept_source_route=0 || true
+    sysctl -qw net.ipv4.conf.all.send_redirects=0 || true
+    sysctl -qw net.ipv4.conf.default.send_redirects=0 || true
+    sysctl -qw net.ipv4.conf.all.accept_redirects=0 || true
+    sysctl -qw net.ipv6.conf.all.forwarding=0 || true
+    local scope cur
+    for scope in all default wg0; do
+        [[ -e "/proc/sys/net/ipv4/conf/${scope}/rp_filter" ]] || continue
+        cur="$(cat "/proc/sys/net/ipv4/conf/${scope}/rp_filter" 2>/dev/null || true)"
+        if [[ "$cur" == "1" ]]; then
+            sysctl -qw "net.ipv4.conf.${scope}.rp_filter=2" || true
+        fi
+    done
+}
+
+apply_forward() {
+    local net="$1"
+    iptables -N PHOBOS_FWD 2>/dev/null || true
+    iptables -F PHOBOS_FWD
+    iptables -A PHOBOS_FWD -d "$net" -j ACCEPT
+    iptables -A PHOBOS_FWD -p udp --dport 443 -j REJECT --reject-with icmp-port-unreachable
+    iptables -A PHOBOS_FWD -j REJECT
+    while iptables -D FORWARD -i wg0 -j PHOBOS_FWD 2>/dev/null; do :; done
+    iptables -I FORWARD 1 -i wg0 -j PHOBOS_FWD
+    while iptables -D FORWARD -i wg0 -j ACCEPT 2>/dev/null; do :; done
+    while iptables -D FORWARD -o wg0 -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null; do :; done
+}
+
+apply_ipv6() {
+    command -v ip6tables >/dev/null 2>&1 || return 0
+    ip6tables -N PHOBOS_FWD6 2>/dev/null || true
+    ip6tables -F PHOBOS_FWD6
+    ip6tables -A PHOBOS_FWD6 -j REJECT --reject-with icmp6-addr-unreachable
+    while ip6tables -D FORWARD -i wg0 -j PHOBOS_FWD6 2>/dev/null; do :; done
+    ip6tables -I FORWARD 1 -i wg0 -j PHOBOS_FWD6
+}
+
+apply_input() {
+    local pub
+    pub="$(public_iface || true)"
+    iptables -N PHOBOS_IN 2>/dev/null || true
+    iptables -F PHOBOS_IN
+    iptables -A PHOBOS_IN -p tcp --dport 1080 -j REJECT
+    iptables -A PHOBOS_IN -p udp --dport 1080 -j REJECT
+    iptables -A PHOBOS_IN -d 172.16.0.0/12 -j REJECT
+    iptables -A PHOBOS_IN -j RETURN
+    while iptables -D INPUT -i wg0 -j PHOBOS_IN 2>/dev/null; do :; done
+    iptables -I INPUT 1 -i wg0 -j PHOBOS_IN
+    if [[ -n "$pub" ]]; then
+        while iptables -D INPUT -i "$pub" -p tcp --dport 1080 -j DROP 2>/dev/null; do :; done
+        while iptables -D INPUT -i "$pub" -p udp --dport 1080 -j DROP 2>/dev/null; do :; done
+        while iptables -D INPUT -i "$pub" -p tcp --dport 5353 -j DROP 2>/dev/null; do :; done
+        while iptables -D INPUT -i "$pub" -p udp --dport 5353 -j DROP 2>/dev/null; do :; done
+        iptables -I INPUT 1 -i "$pub" -p tcp --dport 1080 -j DROP
+        iptables -I INPUT 1 -i "$pub" -p udp --dport 1080 -j DROP
+        iptables -I INPUT 1 -i "$pub" -p tcp --dport 5353 -j DROP
+        iptables -I INPUT 1 -i "$pub" -p udp --dport 5353 -j DROP
+    fi
+}
+
+apply_dns() {
+    # mangle срабатывает раньше nat, поэтому DNS сначала возвращаем из TPROXY,
+    # и только потом REDIRECT забирает порт 53 на локальный фильтр.
+    iptables -t nat -N PHOBOS_DNS 2>/dev/null || true
+    iptables -t nat -F PHOBOS_DNS
+    iptables -t nat -A PHOBOS_DNS -p udp --dport 53 -j REDIRECT --to-ports 5353
+    iptables -t nat -A PHOBOS_DNS -p tcp --dport 53 -j REDIRECT --to-ports 5353
+    while iptables -t nat -D PREROUTING -i wg0 -j PHOBOS_DNS 2>/dev/null; do :; done
+    iptables -t nat -I PREROUTING 1 -i wg0 -j PHOBOS_DNS
+}
+
+apply_tproxy() {
+    local net="$1"
+    modprobe xt_TPROXY 2>/dev/null || true
+    ip rule del fwmark "$TPROXY_MARK" lookup 100 priority 50 2>/dev/null || true
+    ip rule add fwmark "$TPROXY_MARK" lookup 100 priority 50
+    # Метка 2 — выход Psiphon/direct в основную таблицу, не в TPROXY и не в WARP.
+    ip rule del fwmark 2 lookup main priority 40 2>/dev/null || true
+    ip rule add fwmark 2 lookup main priority 40
+    ip route replace local 0.0.0.0/0 dev lo table 100
+    iptables -t mangle -N PHOBOS_PRE 2>/dev/null || true
+    iptables -t mangle -F PHOBOS_PRE
+    iptables -t mangle -A PHOBOS_PRE -d "$net" -j RETURN
+    iptables -t mangle -A PHOBOS_PRE -d 127.0.0.0/8 -j RETURN
+    iptables -t mangle -A PHOBOS_PRE -m addrtype --dst-type LOCAL -j RETURN
+    # Крупные ответы не должны застревать на MTU туннеля.
+    iptables -t mangle -A PHOBOS_PRE -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1240
+    # QUIC (UDP/443) не отдаём в Xray: silent blackhole не даёт браузеру
+    # перейти на TCP, и Psiphon не видит Gemini. ICMP port-unreachable
+    # приходит из PHOBOS_FWD, дальше идёт обычный HTTPS.
+    iptables -t mangle -A PHOBOS_PRE -p udp --dport 443 -j RETURN
+    iptables -t mangle -A PHOBOS_PRE -p udp --dport 53 -j RETURN
+    iptables -t mangle -A PHOBOS_PRE -p tcp --dport 53 -j RETURN
+    iptables -t mangle -A PHOBOS_PRE -p tcp -j TPROXY --on-port "$TPROXY_PORT" --on-ip 127.0.0.1 --tproxy-mark "$TPROXY_MARK"
+    iptables -t mangle -A PHOBOS_PRE -p udp -j TPROXY --on-port "$TPROXY_PORT" --on-ip 127.0.0.1 --tproxy-mark "$TPROXY_MARK"
+    while iptables -t mangle -D PREROUTING -i wg0 -j PHOBOS_PRE 2>/dev/null; do :; done
+    iptables -t mangle -I PREROUTING 1 -i wg0 -j PHOBOS_PRE
+}
+
+flush_client_conntrack() {
+    local net="$1"
+    command -v conntrack >/dev/null 2>&1 || return 0
+    conntrack -D -s "$net" >/dev/null 2>&1 || true
+}
+
+cmd_apply() {
+    ip link show wg0 >/dev/null 2>&1 || exit 0
+    local net
+    net="$(vpn_net)"
+    apply_sysctl
+    apply_forward "$net"
+    drop_open_nat "$net"
+    apply_ipv6
+    apply_input
+    apply_dns
+    apply_tproxy "$net"
+    heal_warp_from_state || true
+    flush_client_conntrack "$net"
+}
+
+cmd_down() {
+    while iptables -t nat -D PREROUTING -i wg0 -j PHOBOS_DNS 2>/dev/null; do :; done
+    iptables -t nat -F PHOBOS_DNS 2>/dev/null || true
+    iptables -t nat -X PHOBOS_DNS 2>/dev/null || true
+    while iptables -t mangle -D PREROUTING -i wg0 -j PHOBOS_PRE 2>/dev/null; do :; done
+    iptables -t mangle -F PHOBOS_PRE 2>/dev/null || true
+    iptables -t mangle -X PHOBOS_PRE 2>/dev/null || true
+    ip rule del fwmark "$TPROXY_MARK" lookup 100 priority 50 2>/dev/null || true
+}
+
+case "${1:-apply}" in
+    apply) cmd_apply ;;
+    down) cmd_down ;;
+    *) echo "usage: $0 apply|down" >&2; exit 2 ;;
+esac
+GUARD
+    chmod 755 "$GUARD"
+
+    mkdir -p /etc/systemd/system/wg-quick@wg0.service.d
+    cat > /etc/systemd/system/wg-quick@wg0.service.d/exit-guard.conf <<'EOF'
+[Service]
+ExecStartPost=/usr/local/sbin/phobos-exit-guard.sh apply
+ExecStopPost=/usr/local/sbin/phobos-exit-guard.sh down
+EOF
+
+    cat > /etc/systemd/system/phobos-exit-guard.service <<'EOF'
+[Unit]
+Description=Phobos client egress lock
+After=wg-quick@wg0.service
+Requires=wg-quick@wg0.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/phobos-exit-guard.sh apply
+ExecStop=/usr/local/sbin/phobos-exit-guard.sh down
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    cat > /etc/sysctl.d/99-phobos-exit.conf <<'EOF'
+net.ipv4.ip_forward = 1
+net.ipv4.conf.all.rp_filter = 2
+net.ipv4.conf.default.rp_filter = 2
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.conf.default.accept_source_route = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv6.conf.all.forwarding = 0
+EOF
+    sysctl --system >/dev/null 2>&1 || true
+}
+
+patch_wg0() {
+    [[ -f "$WG_CONF" ]] || die "Не найден $WG_CONF"
+    cp -a "$WG_CONF" "$BASE/backup/wg0.conf.$(date +%Y%m%d-%H%M%S)"
+    python3 - "$WG_CONF" <<'PY'
+import re, sys
+path = sys.argv[1]
+text = open(path, "r", encoding="utf-8").read().splitlines()
+lines = [ln for ln in text if not re.match(r"(?i)^\s*(PostUp|PostDown)\s*=", ln)]
+insert = [
+    "PostUp = /usr/local/sbin/phobos-exit-guard.sh apply",
+    "PostDown = /usr/local/sbin/phobos-exit-guard.sh down",
+]
+out = []
+done = False
+for ln in lines:
+    if not done and re.match(r"(?i)^\[Peer\]", ln):
+        out.extend(insert)
+        done = True
+    out.append(ln)
+if not done:
+    out.extend(insert)
+with open(path, "w", encoding="utf-8", newline="\n") as f:
+    f.write("\n".join(out) + "\n")
+PY
+    chmod 600 "$WG_CONF"
+    ok "wg0.conf больше не делает MASQUERADE в публичный интерфейс"
+}
+
+generate_xray_config() {
+    section "НАСТРОЙКА XRAY"
+    refresh_psiphon_socks
+    mkdir -p /usr/local/etc/xray
+    python3 - "$XRAY_CFG" "$WARP_BACKEND" "$PSIPHON_SOCKS" "$USE_PSIPHON" "$TPROXY_PORT" "$XRAY_ASSET" <<'PY'
+import json, os, sys
+
+out_path, backend, psock, use_psiphon_str, tport, asset = sys.argv[1:7]
+use_psiphon = use_psiphon_str == "1"
+warp_on = backend == "normal"
+catch_all = "warp-out" if warp_on else "blocked"
+service_out = "psiphon-out" if use_psiphon else "direct"
+# Как в LucX: DNS не должен попасть в UDP-blackhole Google (8.8.8.8 = geoip:google).
+plain_egress = "warp-out" if warp_on else "direct"
+
+def dat_has(filename, tag):
+    path = os.path.join(asset, filename)
+    try:
+        data = open(path, "rb").read()
+    except OSError:
+        return False
+    return tag.encode("ascii", "ignore") in data
+
+services = []
+seen = set()
+for token in ("google", "google-gemini", "google-deepmind", "youtube", "openai", "anthropic"):
+    item = "geosite:" + token
+    if item in seen:
+        continue
+    if dat_has("geosite.dat", token):
+        seen.add(item)
+        services.append(item)
+services += [
+    "full:gemini.google.com",
+    "full:aistudio.google.com",
+    "full:notebooklm.google.com",
+    "full:generativelanguage.googleapis.com",
+    "full:alkalimakersuite-pa.clients6.google.com",
+    "full:chatgpt.com",
+    "full:chat.openai.com",
+    "full:ab.chatgpt.com",
+    "full:api.openai.com",
+    "full:auth0.openai.com",
+    "full:openai.com",
+    "full:claude.ai",
+    "full:anthropic.com",
+    "full:api.anthropic.com",
+    "google.com",
+    "googleapis.com",
+    "googleusercontent.com",
+    "gstatic.com",
+    "googlevideo.com",
+    "youtube.com",
+    "youtu.be",
+    "ggpht.com",
+    "ytimg.com",
+    "youtubei.googleapis.com",
+    "consent.youtube.com",
+]
+
+ru_sites = []
+if os.path.isfile(os.path.join(asset, "geosite_RU.dat")):
+    ru_sites.append("ext:geosite_RU.dat:category-ru")
+if dat_has("geosite.dat", "category-ru"):
+    ru_sites.append("geosite:category-ru")
+ru_sites += ["domain:ru", "domain:su", "domain:xn--p1ai"]
+
+ru_ips = []
+if os.path.isfile(os.path.join(asset, "geoip_RU.dat")):
+    ru_ips.append("ext:geoip_RU.dat:ru")
+ru_ips.append("geoip:ru")
+
+ru_services = [
+    "domain:x5static.net", "domain:yandex.net", "domain:yastatic.net",
+    "domain:yandex.cloud", "domain:beeline.tv", "domain:mycdn.me",
+    "domain:ozonusercontent.com", "domain:mvk.com", "domain:userapi.com",
+    "domain:vk.cc", "domain:vk.com", "domain:vk.company", "domain:vk.link",
+    "domain:vk.me", "domain:vkcdn.net", "domain:vk-cdn.net", "domain:vk-portal.net",
+    "domain:vk-apps.com", "domain:vk-streaming.com", "domain:vkpay.com",
+    "domain:vkuser.net", "domain:vkuseraudio.com", "domain:vkuseraudio.net",
+    "domain:vkuservideo.com", "domain:vkuservideo.net", "domain:vkuserlive.com",
+    "domain:vkuserlive.net", "domain:vkforms.com", "domain:aliexpress.ru",
+]
+
+outbounds = [
+    {"protocol": "blackhole", "tag": "blocked", "settings": {}},
+    {
+        "protocol": "freedom",
+        "tag": "direct",
+        "settings": {"domainStrategy": "UseIPv4"},
+        "streamSettings": {"sockopt": {"mark": 2}},
+    },
+]
+
+if use_psiphon:
+    host, port_s = psock.rsplit(":", 1)
+    outbounds.append({
+        "protocol": "socks",
+        "tag": "psiphon-out",
+        "settings": {"servers": [{"address": host, "port": int(port_s)}]},
+        "streamSettings": {"sockopt": {"mark": 2}},
+    })
+
+if warp_on:
+    outbounds.append({
+        "protocol": "freedom",
+        "tag": "warp-out",
+        "settings": {"domainStrategy": "UseIPv4"},
+        "streamSettings": {"sockopt": {"mark": 255, "domainStrategy": "ForceIPv4"}},
+    })
+
+# Порт 53 перехватывается раньше Xray (фильтр без IPv6). Это правило — запасное:
+# если пакет всё же дошёл, 8.8.8.8 не должен попасть в блок и не в Psiphon.
+# Дальше Google по IP: имя в TLS часто скрыто, и без IP правило запрос уходит в WARP.
+google_ips = [
+    "geoip:google",
+    "8.8.8.8/32",
+    "8.8.4.4/32",
+    "64.233.160.0/19",
+    "66.102.0.0/20",
+    "66.249.80.0/20",
+    "72.14.192.0/18",
+    "74.125.0.0/16",
+    "108.177.8.0/21",
+    "108.177.64.0/19",
+    "108.177.96.0/19",
+    "142.250.0.0/15",
+    "172.217.0.0/16",
+    "172.253.0.0/16",
+    "173.194.0.0/16",
+    "209.85.128.0/17",
+    "216.58.192.0/19",
+    "216.239.32.0/19",
+]
+rules = [
+    {"type": "field", "port": "53", "network": "tcp,udp", "outboundTag": plain_egress},
+    {"type": "field", "ip": google_ips, "outboundTag": service_out},
+    {"type": "field", "domain": services, "network": "tcp", "outboundTag": service_out},
+    {"type": "field", "domain": services, "network": "udp", "outboundTag": "blocked"},
+]
+rules.append({"type": "field", "ip": ru_ips, "outboundTag": "blocked"})
+rules.append({"type": "field", "domain": ru_sites, "outboundTag": "blocked"})
+if dat_has("geosite.dat", "category-ip-geo-detect"):
+    rules.append({"type": "field", "domain": ["geosite:category-ip-geo-detect"], "outboundTag": "blocked"})
+rules.append({"type": "field", "domain": ru_services, "outboundTag": "blocked"})
+rules.append({"type": "field", "ip": ["geoip:private"], "outboundTag": "blocked"})
+rules.append({"type": "field", "protocol": ["bittorrent"], "outboundTag": "blocked"})
+rules.append({"type": "field", "network": "tcp,udp", "outboundTag": catch_all})
+
+cfg = {
+    "log": {"loglevel": "warning"},
+    "inbounds": [{
+        "listen": "127.0.0.1",
+        "port": int(tport),
+        "protocol": "dokodemo-door",
+        "tag": "tproxy-in",
+        "settings": {"network": "tcp,udp", "followRedirect": True},
+        "sniffing": {
+            "enabled": True,
+            "destOverride": ["http", "tls", "quic"],
+            "metadataOnly": False,
+            "routeOnly": True,
+        },
+        "streamSettings": {"sockopt": {"tproxy": "tproxy"}},
+    }],
+    "outbounds": outbounds,
+    "routing": {"domainStrategy": "AsIs", "rules": rules},
+}
+
+if cfg["outbounds"][0]["tag"] != "blocked":
+    raise SystemExit("default outbound must be blocked")
+tags = [x["tag"] for x in cfg["outbounds"]]
+if warp_on:
+    warp = next(x for x in cfg["outbounds"] if x["tag"] == "warp-out")
+    if warp["streamSettings"]["sockopt"].get("mark") != 255:
+        raise SystemExit("warp-out has no mark 255")
+if use_psiphon and "psiphon-out" not in tags:
+    raise SystemExit("psiphon-out missing")
+if "dns" in cfg:
+    raise SystemExit("dns block is not allowed")
+if rules[-1]["outboundTag"] != catch_all:
+    raise SystemExit("catch-all mismatch")
+
+with open(out_path, "w", encoding="utf-8") as f:
+    json.dump(cfg, f, ensure_ascii=False, indent=2)
+    f.write("\n")
+print(out_path)
+PY
+    [[ -s "$XRAY_CFG" ]] || die "Xray config не сформирован"
+    ok "Xray config сформирован"
+}
+
+test_xray_config() {
+    section "ПРОВЕРКА XRAY"
+    local log="$BASE/xray-test.log"
+    XRAY_LOCATION_ASSET="$XRAY_ASSET" "$XRAY_BIN" run -test -config "$XRAY_CFG" 2>&1 | tee "$log"
+    grep -q "Configuration OK" "$log" || die "Xray config не прошёл проверку"
+    ok "Xray: Configuration OK"
+}
+
+install_xray_unit() {
+    cat > /etc/systemd/system/${XRAY_UNIT}.service <<EOF
+[Unit]
+Description=Phobos exit Xray (tproxy)
+After=network-online.target docker.service wg-quick@wg0.service phobos-exit-guard.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Environment=XRAY_LOCATION_ASSET=$XRAY_ASSET
+ExecStart=$XRAY_BIN run -config $XRAY_CFG
+Restart=on-failure
+RestartSec=2
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable phobos-exit-guard.service >/dev/null 2>&1 || true
+    systemctl enable "$XRAY_UNIT" >/dev/null 2>&1 || true
+}
+
+install_dns_filter() {
+    section "DNS БЕЗ IPv6"
+    cat > /usr/local/sbin/phobos-dns-v4.py <<'PY'
+#!/usr/bin/env python3
+"""Отвечает на DNS клиентов туннеля. AAAA/HTTPS/SVCB — пустой NOERROR, остальное уходит в 1.1.1.1."""
+import socket
+import threading
+
+LISTEN = ("0.0.0.0", 5353)
+UPSTREAM = ("1.1.1.1", 53)
+# AAAA, SVCB, HTTPS — иначе браузер узнаёт IPv6 и уходит мимо туннеля.
+DROP_QTYPES = {28, 64, 65}
+SO_MARK = 36
+
+
+def warp_mark():
+    try:
+        for line in open("/etc/phobos-exit-warp.env", encoding="utf-8"):
+            if line.startswith("WARP_OK="):
+                return 255 if line.split("=", 1)[1].strip() == "1" else 0
+    except OSError:
+        pass
+    return 0
+
+
+MARK = warp_mark()
+
+
+def question_end(pkt):
+    i = 12
+    if len(pkt) < 12:
+        return None
+    while i < len(pkt):
+        lab = pkt[i]
+        if lab == 0:
+            i += 1
+            break
+        if lab >= 192:
+            i += 2
+            break
+        i += 1 + lab
+        if i > len(pkt):
+            return None
+    end = i + 4
+    if end > len(pkt):
+        return None
+    return end
+
+
+def qtype_of(pkt):
+    end = question_end(pkt)
+    if end is None:
+        return None
+    return int.from_bytes(pkt[end - 4 : end - 2], "big")
+
+
+def dns_response(query, rcode):
+    end = question_end(query)
+    if end is None:
+        return None
+    hdr = bytearray(query[:12])
+    flags = int.from_bytes(query[2:4], "big")
+    rd = flags & 0x0100
+    hdr[2:4] = (0x8000 | rd | 0x0080 | (rcode & 0x0F)).to_bytes(2, "big")
+    hdr[6:12] = b"\x00" * 6
+    return bytes(hdr) + query[12:end]
+
+
+def forward(payload):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        if MARK:
+            sock.setsockopt(socket.SOL_SOCKET, SO_MARK, MARK)
+        sock.settimeout(3)
+        sock.sendto(payload, UPSTREAM)
+        data, _ = sock.recvfrom(4096)
+        return data
+    finally:
+        sock.close()
+
+
+def answer(payload):
+    qtype = qtype_of(payload)
+    if qtype in DROP_QTYPES:
+        return dns_response(payload, 0)
+    try:
+        return forward(payload)
+    except OSError:
+        return dns_response(payload, 2)
+
+
+def serve_udp():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(LISTEN)
+    send_lock = threading.Lock()
+    while True:
+        data, addr = sock.recvfrom(4096)
+        def reply(data=data, addr=addr):
+            out = answer(data)
+            if not out:
+                return
+            with send_lock:
+                sock.sendto(out, addr)
+        threading.Thread(target=reply, daemon=True).start()
+
+
+def handle_tcp(conn):
+    try:
+        conn.settimeout(5)
+        chunks = b""
+        while len(chunks) < 2:
+            part = conn.recv(2 - len(chunks))
+            if not part:
+                return
+            chunks += part
+        size = int.from_bytes(chunks, "big")
+        if size < 12 or size > 4096:
+            return
+        buf = b""
+        while len(buf) < size:
+            part = conn.recv(size - len(buf))
+            if not part:
+                return
+            buf += part
+        out = answer(buf)
+        if not out:
+            return
+        conn.sendall(len(out).to_bytes(2, "big") + out)
+    except OSError:
+        return
+    finally:
+        conn.close()
+
+
+def serve_tcp():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(LISTEN)
+    sock.listen(64)
+    while True:
+        conn, _ = sock.accept()
+        threading.Thread(target=handle_tcp, args=(conn,), daemon=True).start()
+
+
+if __name__ == "__main__":
+    threading.Thread(target=serve_tcp, daemon=True).start()
+    serve_udp()
+PY
+    chmod 755 /usr/local/sbin/phobos-dns-v4.py
+    cat > /etc/systemd/system/phobos-dns.service <<'EOF'
+[Unit]
+Description=Phobos DNS without IPv6 answers
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/sbin/phobos-dns-v4.py
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable phobos-dns >/dev/null 2>&1 || true
+    ok "DNS-фильтр: клиентам туннеля не отдаются IPv6-адреса"
+}
+
+restart_data_plane() {
+    section "ЗАПУСК ВЫХОДА"
+    if [[ "$WARP_OK" == "1" ]]; then
+        [[ -n "$WARP_DEV" ]] || WARP_DEV="$(get_active_normal_warp || true)"
+        heal_policy_routing "$WARP_DEV"
+    fi
+    systemctl restart phobos-dns || die "phobos-dns не запустился"
+    systemctl is-active --quiet phobos-dns || die "phobos-dns не ACTIVE"
+    "$GUARD" apply || die "Не удалось закрыть прямой выход wg0"
+    systemctl restart "$XRAY_UNIT" || die "phobos-xray не запустился"
+    local i
+    for ((i = 1; i <= 20; i++)); do
+        if systemctl is-active --quiet "$XRAY_UNIT"; then
+            ok "phobos-xray ACTIVE"
+            break
+        fi
+        sleep 1
+    done
+    systemctl is-active --quiet "$XRAY_UNIT" || die "phobos-xray не ACTIVE"
+
+    systemctl restart wg-quick@wg0
+    local unit
+    for unit in $(systemctl list-units 'wg-obfuscator-*' --no-legend --plain --type=service 2>/dev/null | awk '{print $1}'); do
+        systemctl restart "$unit" >/dev/null 2>&1 || true
+    done
+    "$GUARD" apply || die "Повторное закрытие выхода wg0 не удалось"
+    if [[ "$WARP_OK" == "1" ]]; then
+        heal_policy_routing "$WARP_DEV"
+    fi
+    if command -v conntrack >/dev/null 2>&1; then
+        conntrack -D -s "$(vpn_net)" >/dev/null 2>&1 || true
+    fi
+    ok "wg0 и обфускатор перезапущены, старые NAT-сессии сброшены"
+}
+
+verify_exit_policy() {
+    section "ПРОВЕРКА ОТСУТСТВИЯ ПРЯМОГО ВЫХОДА"
+    local net pub rule
+    net="$(vpn_net)"
+    pub="$(public_iface || true)"
+    iptables -C FORWARD -i wg0 -j PHOBOS_FWD || die "Нет запрета FORWARD с wg0"
+    iptables -t mangle -C PREROUTING -i wg0 -j PHOBOS_PRE || die "Нет TPROXY с wg0"
+    local listeners
+    listeners="$(ss -lntu 2>/dev/null || true)"
+    grep -Eq "127\.0\.0\.1:${TPROXY_PORT}([^0-9]|$)" <<<"$listeners" || die "Xray не слушает 127.0.0.1:${TPROXY_PORT}"
+    systemctl is-active --quiet phobos-dns || die "phobos-dns не ACTIVE"
+    grep -Eq ":${DNS_FILTER_PORT}([^0-9]|$)" <<<"$listeners" || die "DNS-фильтр не слушает ${DNS_FILTER_PORT}"
+    iptables -t nat -C PREROUTING -i wg0 -j PHOBOS_DNS || die "Нет перехвата DNS с wg0"
+
+    while read -r rule; do
+        [[ "$rule" == *" -j MASQUERADE"* || "$rule" == *" -j SNAT"* ]] || continue
+        if [[ "$rule" != *" -s "* && "$rule" == *" -j MASQUERADE"* ]]; then
+            die "Остался открытый MASQUERADE: $rule"
+        fi
+        if [[ "$rule" == *" -s ${net} "* ]]; then
+            die "Остался NAT сети клиентов: $rule"
+        fi
+    done < <(iptables -t nat -S POSTROUTING)
+
+    [[ -n "$pub" && "$pub" != "warp" ]] || die "Default route смотрит в WARP (${pub:-empty})"
+
+    if [[ "$WARP_OK" == "1" ]]; then
+        if ! has_warp_fwmark_rule; then
+            warn "ip rule fwmark ${WARP_MARK} отсутствует — восстанавливаем"
+            heal_policy_routing "$WARP_DEV"
+        fi
+        has_warp_fwmark_rule || {
+            echo "Текущие ip rule:"
+            ip rule show || true
+            die "Нет ip rule fwmark ${WARP_MARK}"
+        }
+        ip route show table "$WARP_TABLE" | grep -q "^default" || die "В таблице ${WARP_TABLE} нет default"
+        local wdev
+        wdev="$(ip route show table "$WARP_TABLE" | awk '/^default/ {for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit }}')"
+        [[ "$wdev" == "warp" ]] || die "Таблица WARP смотрит не в туннель ($wdev)"
+    fi
+
+    if [[ "$USE_PSIPHON" == "1" ]]; then
+        refresh_psiphon_socks
+        get_active_psiphon_trace >/dev/null || die "Psiphon выбран, но SOCKS не отвечает"
+        [[ "$PSIPHON_SOCKS" != 0.0.0.0:* && "$PSIPHON_SOCKS" != ":"* ]] || die "Psiphon слушает слишком широко"
+        ok "Psiphon активен (${PSIPHON_SOCKS})"
+    else
+        if command -v docker >/dev/null 2>&1; then
+            if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qiE '(^|-)psiphon($|-)'; then
+                warn "Psiphon отключён в политике, но контейнер ещё есть — удаляем"
+                disable_psiphon || true
+            fi
+            if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qiE '(^|-)psiphon($|-)'; then
+                die "Psiphon отключён, но контейнер всё ещё на сервере"
+            fi
+        fi
+        ok "Psiphon не используется и контейнер отсутствует"
+    fi
+
+    ok "Прямой выход клиентов закрыт"
+    echo "    VPN сеть     : $net"
+    echo "    Публичный NIC: $pub"
+    echo "    TPROXY       : 127.0.0.1:${TPROXY_PORT}"
+    echo "    Catch-all    : $([[ "$WARP_OK" == 1 ]] && echo "WARP fwmark ${WARP_MARK}" || echo "BLACKHOLE")"
+}
+
+backup_state() {
+    section "РЕЗЕРВНЫЕ КОПИИ"
+    local stamp="$BASE/backup/$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "$stamp"
+    [[ -f "$WG_CONF" ]] && cp -a "$WG_CONF" "$stamp/wg0.conf"
+    [[ -f "$PANEL_DIR/settings.json" ]] && cp -a "$PANEL_DIR/settings.json" "$stamp/settings.json"
+    [[ -f "$XRAY_CFG" ]] && cp -a "$XRAY_CFG" "$stamp/phobos-exit.json"
+    ok "Копии в $stamp"
+}
+
+print_panel_credentials() {
+    section "ВХОД В ПАНЕЛЬ PCA PHOBOS"
+    local port ip pass apikey reset_choice new_pass
+    port="$(tr -d '[:space:]' < "$PANEL_DIR/.port" 2>/dev/null || true)"
+    [[ -n "$port" ]] || port="8443"
+    ip="$(curl -4fsS --max-time 6 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')"
+    pass="$(python3 - "$PANEL_DIR/settings.json" <<'PY'
+import json, sys
+print(json.load(open(sys.argv[1], encoding="utf-8")).get("admin_pass", ""))
+PY
+)"
+    apikey="$(python3 - "$PANEL_DIR/settings.json" <<'PY'
+import json, sys
+print(json.load(open(sys.argv[1], encoding="utf-8")).get("server_api_key", ""))
+PY
+)"
+    echo "------------------------------------------------------------"
+    echo -e "  Адрес : ${CYAN}http://${ip}:${port}${RESET}"
+    echo -e "  Логин : ${GREEN}admin${RESET}"
+    if [[ -n "$pass" ]]; then
+        echo -e "  Пароль: ${GREEN}${pass}${RESET}"
+    else
+        echo -e "  Пароль: ${YELLOW}не прочитан из settings.json${RESET}"
+    fi
+    if [[ -n "$apikey" ]]; then
+        echo -e "  API key: ${CYAN}${apikey}${RESET}"
+    fi
+    echo "------------------------------------------------------------"
+    echo
+    echo "1) Задать новый пароль панели"
+    echo "0) Пропуск"
+    echo
+    read -rp "Выберите действие [1/0, Enter=0]: " reset_choice
+    reset_choice="${reset_choice:-0}"
+    if [[ "$reset_choice" == "1" ]]; then
+        new_pass="$(openssl rand -base64 12 | tr -d '/+=' | head -c 16)"
+        python3 - "$PANEL_DIR/settings.json" "$new_pass" <<'PY'
+import json, sys
+path, new = sys.argv[1], sys.argv[2]
+with open(path, encoding="utf-8") as f:
+    data = json.load(f)
+data["admin_pass"] = new
+with open(path, "w", encoding="utf-8", newline="\n") as f:
+    json.dump(data, f, ensure_ascii=False, indent=2)
+    f.write("\n")
+PY
+        chmod 600 "$PANEL_DIR/settings.json" || true
+        systemctl restart "$PANEL_UNIT"
+        ok "Новый пароль панели: ${new_pass}"
+    else
+        ok "Пароль не менялся"
+    fi
+}
+
+main() {
+    section "WARP + PSIPHON + PCA PHOBOS"
+    echo "Старт: $(date)"
+    remember_default_route
+    cleanup_firewall_rules
+    install_minimal
+    install_phobos
+    lock_client_egress
+    install_dependencies
+    manage_warp
+    manage_psiphon
+    check_psiphon
+    install_xray
+    write_guard
+    patch_wg0
+    backup_state
+    generate_xray_config
+    test_xray_config
+    install_xray_unit
+    install_dns_filter
+    local pinned
+    pinned="$(pin_client_full_tunnel)"
+    restart_data_plane
+    verify_exit_policy
+
+    section "ГОТОВО"
+    echo "Панель        : PCA Phobos"
+    echo "WARP backend  : $WARP_BACKEND"
+    if [[ "$USE_PSIPHON" == "1" ]]; then
+        echo "Psiphon SOCKS : $PSIPHON_SOCKS"
+        echo "Google/Gemini : Psiphon по IP Google (имя сайта не обязательно)"
+        echo "DNS           : клиенту не отдаются IPv6, QUIC закрыт"
+        echo "Порт 53       : локальный фильтр, дальше WARP"
+    else
+        echo "Psiphon       : ОТКЛЮЧЕН"
+        echo "Google/Gemini/YouTube/OpenAI/Anthropic : напрямую с IP сервера (мимо WARP)"
+    fi
+    if [[ "$WARP_OK" == "1" ]]; then
+        echo "Остальной трафик : WARP (fwmark ${WARP_MARK}, table ${WARP_TABLE})"
+    else
+        echo "Остальной трафик : BLACKHOLE"
+    fi
+    echo "RU            : BLOCKED после правил Google"
+    echo "Прямой NAT    : ВЫКЛЮЧЕН"
+    echo "DNS           : AAAA не отдаётся, запрос дальше идёт в WARP"
+    echo "IPv6 в туннеле: отказ, браузер переходит на IPv4"
+    if [[ "${pinned:-0}" != "0" ]]; then
+        echo "Конфиги клиентов: в AllowedIPs добавлен ::/0 (${pinned})"
+        systemctl restart "$PANEL_UNIT" >/dev/null 2>&1 || true
+    fi
+    echo "Подключения   : создаются в панели Phobos, скрипт их не генерирует"
+    echo "Если Google всё ещё пишет про страну — переподключите туннель."
+    echo "В клиенте WireGuard должно быть AllowedIPs = 0.0.0.0/0, ::/0."
+    echo "На телефоне выключите Private DNS / безопасный DNS."
+    echo
+    print_panel_credentials
+    echo
+    systemctl is-active --quiet "$PANEL_UNIT" && ok "Панель phobos-panel ACTIVE" || warn "Панель phobos-panel не ACTIVE"
+    ok "Установка и политика выхода завершены"
+}
+
+main "$@"
