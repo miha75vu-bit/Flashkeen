@@ -581,58 +581,69 @@ manage_psiphon() {
         echo "    SOCKS: $PSIPHON_SOCKS"
         echo "    Exit IP: ${ip:-unknown}"
         echo "    Country: ${loc:-unknown}"
+        while true; do
+            echo
+            echo "Psiphon — режим для работы Gemini. Пока нормально не работает, можете протестировать."
+            echo "Если Gemini не откроется, запустите скрипт ещё раз и выберите «Не использовать Psiphon»."
+            echo
+            echo "0) Оставить текущий рабочий Psiphon (пропустить переустановку)"
+            echo "1) Переустановить / сменить регион Psiphon"
+            echo "2) Не использовать Psiphon (Google/Gemini/OpenAI/Anthropic пойдут напрямую с IP сервера, мимо WARP)"
+            echo
+            read -rp "Выберите действие [0/1/2, Enter=0]: " choice
+            choice="${choice:-0}"
+            case "$choice" in
+                0)
+                    ok "Сохраняем текущий рабочий Psiphon"
+                    USE_PSIPHON=1
+                    return 0
+                    ;;
+                1)
+                    install_psiphon_core || die "Psiphon не удалось запустить"
+                    USE_PSIPHON=1
+                    return 0
+                    ;;
+                2)
+                    info "Не используем Psiphon..."
+                    disable_psiphon || warn "Psiphon мог остаться в фоне — проверьте: docker ps | grep -i psiphon"
+                    ok "Psiphon выключен и контейнер удалён. Google/Gemini/OpenAI/Anthropic пойдут напрямую (direct), остальное — в WARP или в блок"
+                    return 0
+                    ;;
+                *)
+                    warn "Нет пункта «${choice}». Нужно 0, 1 или 2."
+                    ;;
+            esac
+        done
+    fi
+
+    warn "Активный рабочий Psiphon не обнаружен"
+    while true; do
         echo
         echo "Psiphon — режим для работы Gemini. Пока нормально не работает, можете протестировать."
         echo "Если Gemini не откроется, запустите скрипт ещё раз и выберите «Не использовать Psiphon»."
         echo
-        echo "0) Оставить текущий рабочий Psiphon (пропустить переустановку)"
-        echo "1) Переустановить / сменить регион Psiphon"
+        echo "1) Установить Psiphon"
         echo "2) Не использовать Psiphon (Google/Gemini/OpenAI/Anthropic пойдут напрямую с IP сервера, мимо WARP)"
         echo
-        read -rp "Выберите действие [0/1/2, Enter=0]: " choice
-        choice="${choice:-0}"
+        read -rp "Выберите действие [1/2, Enter=1]: " choice
+        choice="${choice:-1}"
         case "$choice" in
-            0)
-                ok "Сохраняем текущий рабочий Psiphon"
-                USE_PSIPHON=1
-                return 0
-                ;;
             1)
                 install_psiphon_core || die "Psiphon не удалось запустить"
                 USE_PSIPHON=1
                 return 0
                 ;;
-            2)
+            0|2)
                 info "Не используем Psiphon..."
                 disable_psiphon || warn "Psiphon мог остаться в фоне — проверьте: docker ps | grep -i psiphon"
                 ok "Psiphon выключен и контейнер удалён. Google/Gemini/OpenAI/Anthropic пойдут напрямую (direct), остальное — в WARP или в блок"
                 return 0
                 ;;
             *)
-                die "Неизвестный выбор Psiphon. Выход без изменения политики."
+                warn "Нет пункта «${choice}». Нужно 1 или 2."
                 ;;
         esac
-    fi
-
-    warn "Активный рабочий Psiphon не обнаружен"
-    echo
-    echo "Psiphon — режим для работы Gemini. Пока нормально не работает, можете протестировать."
-    echo "Если Gemini не откроется, запустите скрипт ещё раз и выберите «Не использовать Psiphon»."
-    echo
-    echo "1) Установить Psiphon"
-    echo "0) Не использовать Psiphon (Google/Gemini/OpenAI/Anthropic пойдут напрямую с IP сервера)"
-    echo
-    read -rp "Выберите действие [1/0, Enter=1]: " choice
-    choice="${choice:-1}"
-    if [[ "$choice" == "0" ]]; then
-        info "Не используем Psiphon..."
-        disable_psiphon || warn "Psiphon мог остаться в фоне — проверьте: docker ps | grep -i psiphon"
-        ok "Psiphon выключен и контейнер удалён. Google/Gemini/OpenAI/Anthropic пойдут напрямую (direct), остальное — в WARP или в блок"
-        return 0
-    fi
-    [[ "$choice" == "1" ]] || die "Неизвестный выбор Psiphon."
-    install_psiphon_core || die "Psiphon не удалось запустить"
-    USE_PSIPHON=1
+    done
 }
 
 check_psiphon() {
