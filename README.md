@@ -127,6 +127,10 @@ Flashkeen умеет проверять обновления при запуск
 ```sh
 opkg disk storage:/ https://bin.entware.net/mipselsf-k3.4/installer/mipsel-installer.tar.gz
 ```
+Вариант если офф сборка недоступна:
+```sh
+opkg disk storage:/ https://sw.ext.io/ent/installers/mipsel_installer_dropbear_custom_offline.tar.gz
+```
 
 </details>
 
@@ -134,7 +138,11 @@ opkg disk storage:/ https://bin.entware.net/mipselsf-k3.4/installer/mipsel-insta
 <summary>▸ mips</summary>
 
 ```sh
-opkg disk storage:/ https://bin.entware.net/mipssf-k3.4/installer/mips-installer.tar.gz
+opkg disk storage:/ https://sw.ext.io/ent/installers/mips_installer_dropbear_custom_offline.tar.gz
+```
+Вариант если офф сборка недоступна:
+```sh
+opkg disk storage:/ https://sw.ext.io/ent/installers/aarch64_installer_dropbear_custom_offline.tar.gz
 ```
 
 </details>
@@ -144,6 +152,10 @@ opkg disk storage:/ https://bin.entware.net/mipssf-k3.4/installer/mips-installer
 
 ```sh
 opkg disk storage:/ https://bin.entware.net/aarch64-k3.10/installer/aarch64-installer.tar.gz
+```
+Вариант если офф сборка недоступна:
+```sh
+opkg disk storage:/ https://sw.ext.io/ent/installers/aarch64_installer_dropbear_custom_offline.tar.gz
 ```
 
 </details>
