@@ -138,7 +138,7 @@ opkg disk storage:/ https://sw.ext.io/ent/installers/mipsel_installer_dropbear_c
 <summary>▸ mips</summary>
 
 ```sh
-opkg disk storage:/ https://sw.ext.io/ent/installers/mips_installer_dropbear_custom_offline.tar.gz
+opkg disk storage:/ https://bin.entware.net/mipssf-k3.4/installer/mips-installer.tar.gz
 ```
 Вариант если офф сборка недоступна:
 ```sh
